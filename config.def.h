@@ -1464,7 +1464,7 @@
 #define DEFAULT_RUN_AHEAD_HIDE_WARNINGS false
 
 /* Enable stdin/network command interface. */
-#define DEFAULT_NETWORK_CMD_ENABLE false
+#define DEFAULT_NETWORK_CMD_ENABLE true
 #define DEFAULT_NETWORK_CMD_PORT 55355
 #define DEFAULT_NETWORK_REMOTE_BASE_PORT 55400
 #define DEFAULT_STDIN_CMD_ENABLE false

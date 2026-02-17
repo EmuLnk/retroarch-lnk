@@ -209,6 +209,10 @@ static void network_command_free(command_t *handle)
    free(handle);
 }
 
+/* Forward declaration — implementation after command_memory_get_pointer() */
+static void command_handle_emulnk_binary(command_t *handle,
+      const uint8_t *buf, ssize_t len);
+
 static void command_network_poll(command_t *handle)
 {
    ssize_t ret;
@@ -226,6 +230,16 @@ static void command_network_poll(command_t *handle)
                   (struct sockaddr*)&netcmd->cmd_source,
                   &netcmd->cmd_source_len)) <= 0)
          return;
+
+      /* EmuLnk binary protocol detection: binary packets are at least
+       * 8 bytes and start with a non-ASCII-letter byte. Text commands
+       * always start with a letter (A-Z, a-z). */
+      if (ret >= 8 && !((buf[0] >= 'A' && buf[0] <= 'Z')
+               || (buf[0] >= 'a' && buf[0] <= 'z')))
+      {
+         command_handle_emulnk_binary(handle, (uint8_t*)buf, ret);
+         continue;
+      }
 
       buf[ret] = '\0';
 
@@ -1030,6 +1044,90 @@ static uint8_t *command_memory_get_pointer(
    *max_bytes = 0;
    return NULL;
 }
+
+#if defined(HAVE_NETWORK_CMD)
+/**
+ * command_handle_emulnk_binary:
+ *
+ * Handle EmuLnk binary protocol packets.
+ * READ:  8-byte header [4B address LE][4B size LE] → respond with raw bytes
+ * WRITE: 8-byte header + data payload → write to core memory
+ */
+static void command_handle_emulnk_binary(command_t *handle,
+      const uint8_t *buf, ssize_t len)
+{
+   uint32_t address;
+   uint32_t size;
+   unsigned int max_bytes       = 0;
+   char error_buf[64]           = "";
+   command_network_t *netcmd    = (command_network_t*)handle->userptr;
+   runloop_state_t *runloop_st  = runloop_state_get_ptr();
+   const rarch_system_info_t
+      *sys_info                 = &runloop_st->system;
+
+   address = (uint32_t)buf[0]
+           | ((uint32_t)buf[1] << 8)
+           | ((uint32_t)buf[2] << 16)
+           | ((uint32_t)buf[3] << 24);
+   size    = (uint32_t)buf[4]
+           | ((uint32_t)buf[5] << 8)
+           | ((uint32_t)buf[6] << 16)
+           | ((uint32_t)buf[7] << 24);
+
+   if (len == 8)
+   {
+      /* READ request: 8-byte header only */
+      const uint8_t *data;
+
+      if (size > 1024)
+         size = 1024;
+
+      data = command_memory_get_pointer(sys_info, address, &max_bytes,
+            0, error_buf, sizeof(error_buf));
+
+      if (data)
+      {
+         if (size > max_bytes)
+            size = max_bytes;
+
+         sendto(netcmd->net_fd, (const char*)data, size, 0,
+               (struct sockaddr*)&netcmd->cmd_source,
+               netcmd->cmd_source_len);
+      }
+      return;
+   }
+
+   if (len > 8)
+   {
+      /* WRITE request: 8-byte header + data */
+      uint32_t write_size = (uint32_t)(len - 8);
+      uint8_t *data;
+
+      if (write_size > size)
+         write_size = size;
+
+      data = command_memory_get_pointer(sys_info, address, &max_bytes,
+            1, error_buf, sizeof(error_buf));
+
+      if (data)
+      {
+         if (write_size > max_bytes)
+            write_size = max_bytes;
+
+         memcpy(data, buf + 8, write_size);
+
+#ifdef HAVE_CHEEVOS
+         if (rcheevos_hardcore_active())
+         {
+            RARCH_LOG("[EmuLnk] Achievements hardcore mode disabled by memory write.\n");
+            rcheevos_pause_hardcore();
+         }
+#endif
+      }
+      return;
+   }
+}
+#endif
 
 bool command_get_status(command_t *cmd, const char* arg)
 {
