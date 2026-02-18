@@ -1202,8 +1202,8 @@ static void command_handle_emulnk_binary(command_t *handle,
       /* READ request: 8-byte header only */
       const uint8_t *data;
 
-      if (size > 1024)
-         size = 1024;
+      if (size > 2048)
+         size = 2048;
 
       data = command_memory_get_pointer(sys_info, address, &max_bytes,
             0, error_buf, sizeof(error_buf));
