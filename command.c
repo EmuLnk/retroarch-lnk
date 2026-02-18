@@ -63,11 +63,13 @@
 #include "list_special.h"
 #include "paths.h"
 #include "retroarch.h"
+#include "core.h"
 #include "runloop.h"
 #include "verbosity.h"
 #include "version.h"
 #include "version_git.h"
 #include "tasks/task_content.h"
+#include "tasks/task_database_cue.h"
 
 #define CMD_BUF_SIZE 4096
 
@@ -967,6 +969,78 @@ bool command_load_core(command_t *cmd, const char* arg)
    return true;
 }
 
+#if defined(HAVE_NETWORK_CMD)
+#define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
+
+static char emulnk_game_serial[16]       = {0};
+static bool emulnk_serial_extracted      = false;
+static char emulnk_serial_content[PATH_MAX_LENGTH] = {0};
+
+static void emulnk_extract_game_serial(void)
+{
+   const char *content_path = path_get(RARCH_PATH_CONTENT);
+   const char *real_path    = NULL;
+   const char *ext          = NULL;
+   content_state_t *p_content = content_state_get_ptr();
+   uint64_t filesize        = 0; /* required by serial functions, value unused */
+
+   emulnk_game_serial[0]   = '\0';
+   emulnk_serial_extracted  = true;
+
+   if (string_is_empty(content_path))
+   {
+      emulnk_serial_content[0] = '\0';
+      return;
+   }
+
+   strlcpy(emulnk_serial_content, content_path,
+         sizeof(emulnk_serial_content));
+
+   /* For archives (.zip), RARCH_PATH_CONTENT has the original archive path.
+    * The actual extracted file path is in the content list — use that
+    * so serial extraction can read the uncompressed disc image. */
+   if (   p_content
+       && p_content->content_list
+       && p_content->content_list->entries
+       && !string_is_empty(p_content->content_list->entries[0].full_path))
+      real_path = p_content->content_list->entries[0].full_path;
+   else
+      real_path = content_path;
+
+   ext = path_get_extension(real_path);
+   if (string_is_empty(ext))
+      return;
+
+   if (     string_is_equal_noncase(ext, "cue")
+         || string_is_equal_noncase(ext, "m3u"))
+      task_database_cue_get_serial(real_path,
+            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+   else if (string_is_equal_noncase(ext, "chd"))
+      task_database_chd_get_serial(real_path,
+            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+   else if (string_is_equal_noncase(ext, "iso"))
+      intfstream_file_get_serial(real_path, 0, 0,
+            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+   else if (string_is_equal_noncase(ext, "bin")
+         || string_is_equal_noncase(ext, "img"))
+   {
+      /* For raw .bin/.img disc images, detect_system() fails because the
+       * magic byte offsets assume 2048-byte sectors, but raw CD images use
+       * 2352-byte sectors. Call detect_ps1_game() directly — it scans the
+       * raw bytes for serial patterns and handles both sector sizes. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         detect_ps1_game(fd, emulnk_game_serial,
+               sizeof(emulnk_game_serial), real_path);
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+}
+#endif
+
 static const rarch_memory_descriptor_t* command_memory_get_descriptor(const rarch_memory_map_t* mmap, unsigned address, size_t* offset)
 {
    const rarch_memory_descriptor_t* desc = mmap->descriptors;
@@ -1022,8 +1096,27 @@ static uint8_t *command_memory_get_pointer(
       unsigned address, unsigned int* max_bytes,
       int for_write, char *s, size_t len)
 {
-   if (!sys_info || sys_info->mmaps.num_descriptors == 0)
-      strlcpy(s, " -1 no memory map defined\n", len);
+   if (!sys_info)
+      strlcpy(s, " -1 no system info\n", len);
+   else if (sys_info->mmaps.num_descriptors == 0)
+   {
+      /* No memory map descriptors — fall back to retro_get_memory_data.
+       * This supports cores like SwanStation that expose RAM via
+       * RETRO_MEMORY_SYSTEM_RAM but don't set RETRO_ENVIRONMENT_SET_MEMORY_MAPS. */
+      retro_ctx_memory_info_t meminfo;
+      meminfo.id = RETRO_MEMORY_SYSTEM_RAM;
+      if (core_get_memory(&meminfo) && meminfo.data && meminfo.size > 0)
+      {
+         if (address < meminfo.size)
+         {
+            *max_bytes = (unsigned int)(meminfo.size - address);
+            return (uint8_t*)meminfo.data + address;
+         }
+         strlcpy(s, " -1 address out of bounds\n", len);
+      }
+      else
+         strlcpy(s, " -1 no memory available\n", len);
+   }
    else
    {
       size_t offset;
@@ -1073,6 +1166,36 @@ static void command_handle_emulnk_binary(command_t *handle,
            | ((uint32_t)buf[5] << 8)
            | ((uint32_t)buf[6] << 16)
            | ((uint32_t)buf[7] << 24);
+
+   /* Reset serial cache if content path changed */
+   if (emulnk_serial_extracted)
+   {
+      const char *cur_path = path_get(RARCH_PATH_CONTENT);
+      if (   string_is_empty(cur_path)
+          || !string_is_equal(cur_path, emulnk_serial_content))
+         emulnk_serial_extracted = false;
+   }
+
+   /* Virtual address: game serial extracted from disc image */
+   if (address == EMULNK_VIRTUAL_GAME_SERIAL_ADDR && len == 8)
+   {
+      if (!emulnk_serial_extracted)
+         emulnk_extract_game_serial();
+      if (emulnk_game_serial[0] != '\0')
+      {
+         uint32_t serial_len = (uint32_t)strlen(emulnk_game_serial);
+         if (size > serial_len)
+            size = serial_len;
+      }
+      else
+         size = 0;
+      /* Always respond — empty response means no serial detected,
+       * avoids client timeout on unsupported formats */
+      sendto(netcmd->net_fd, emulnk_game_serial, size, 0,
+            (struct sockaddr*)&netcmd->cmd_source,
+            netcmd->cmd_source_len);
+      return;
+   }
 
    if (len == 8)
    {
