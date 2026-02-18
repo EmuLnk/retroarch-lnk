@@ -233,11 +233,14 @@ static void command_network_poll(command_t *handle)
                   &netcmd->cmd_source_len)) <= 0)
          return;
 
-      /* EmuLnk binary protocol detection: binary packets are at least
-       * 8 bytes and start with a non-ASCII-letter byte. Text commands
-       * always start with a letter (A-Z, a-z). */
-      if (ret >= 8 && !((buf[0] >= 'A' && buf[0] <= 'Z')
-               || (buf[0] >= 'a' && buf[0] <= 'z')))
+      /* EmuLnk binary protocol detection: the first 4 bytes encode a
+       * LE memory address which always contains at least one
+       * non-printable byte. Text commands are pure printable ASCII. */
+      if (ret >= 8
+          && (buf[0] < 0x20 || buf[0] > 0x7E
+           || buf[1] < 0x20 || buf[1] > 0x7E
+           || buf[2] < 0x20 || buf[2] > 0x7E
+           || buf[3] < 0x20 || buf[3] > 0x7E))
       {
          command_handle_emulnk_binary(handle, (uint8_t*)buf, ret);
          continue;
