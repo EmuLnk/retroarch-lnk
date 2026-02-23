@@ -237,10 +237,10 @@ static void command_network_poll(command_t *handle)
        * LE memory address which always contains at least one
        * non-printable byte. Text commands are pure printable ASCII. */
       if (ret >= 8
-          && (buf[0] < 0x20 || buf[0] > 0x7E
-           || buf[1] < 0x20 || buf[1] > 0x7E
-           || buf[2] < 0x20 || buf[2] > 0x7E
-           || buf[3] < 0x20 || buf[3] > 0x7E))
+          && ((uint8_t)buf[0] < 0x20 || (uint8_t)buf[0] > 0x7E
+           || (uint8_t)buf[1] < 0x20 || (uint8_t)buf[1] > 0x7E
+           || (uint8_t)buf[2] < 0x20 || (uint8_t)buf[2] > 0x7E
+           || (uint8_t)buf[3] < 0x20 || (uint8_t)buf[3] > 0x7E))
       {
          command_handle_emulnk_binary(handle, (uint8_t*)buf, ret);
          continue;
@@ -973,9 +973,10 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
+/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB) */
 #define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
 
-static char emulnk_game_serial[16]       = {0};
+static char emulnk_game_serial[32]       = {0};
 static bool emulnk_serial_extracted      = false;
 static char emulnk_serial_content[PATH_MAX_LENGTH] = {0};
 
@@ -1039,6 +1040,108 @@ static void emulnk_extract_game_serial(void)
                sizeof(emulnk_game_serial), real_path);
          intfstream_close(fd);
          free(fd);
+      }
+   }
+   else if (string_is_equal_noncase(ext, "sfc")
+         || string_is_equal_noncase(ext, "smc")
+         || string_is_equal_noncase(ext, "swc")
+         || string_is_equal_noncase(ext, "fig"))
+   {
+      /* SNES ROM: snes9x does not expose ROM via memory maps
+       * (no SET_MEMORY_MAPS and ROM is commented out in retro_get_memory_data),
+       * so extract the internal ROM name directly from the file.
+       * Detect LoROM vs HiROM by scoring both potential header locations. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         int64_t fsize       = intfstream_get_size(fd);
+         int copier_offset   = (fsize % 1024 == 512) ? 512 : 0;
+         uint8_t lo_hdr[32]  = {0};
+         uint8_t hi_hdr[32]  = {0};
+         int lo_score        = 0;
+         int hi_score        = 0;
+         const uint8_t *winner;
+         int i;
+
+         if (fsize < copier_offset + 0x8000) /* too small for valid SNES ROM */
+         {
+            intfstream_close(fd);
+            free(fd);
+            return;
+         }
+
+         /* Read LoROM header candidate at file offset $7FC0 */
+         if (fsize >= copier_offset + 0x7FC0 + 32)
+         {
+            intfstream_seek(fd, copier_offset + 0x7FC0, SEEK_SET);
+            intfstream_read(fd, lo_hdr, 32);
+         }
+
+         /* Read HiROM header candidate at file offset $FFC0 */
+         if (fsize >= copier_offset + 0xFFC0 + 32)
+         {
+            intfstream_seek(fd, copier_offset + 0xFFC0, SEEK_SET);
+            intfstream_read(fd, hi_hdr, 32);
+         }
+
+         intfstream_close(fd);
+         free(fd);
+
+         /* Score LoROM: map mode byte at header+0x15.
+          * Valid map modes: 0x20 (LoROM), 0x30 (LoROM+FastROM).
+          * Bit 0 clear = LoROM. */
+         {
+            uint8_t map   = lo_hdr[0x15];
+            uint8_t rom_type = lo_hdr[0x16];
+            uint16_t comp = lo_hdr[0x1C] | (lo_hdr[0x1D] << 8);
+            uint16_t csum = lo_hdr[0x1E] | (lo_hdr[0x1F] << 8);
+
+            if ((map & 0x01) == 0 && (map == 0x20 || map == 0x30))
+               lo_score += 5;
+            if (rom_type <= 0x03)
+               lo_score += 1;
+            if ((comp ^ csum) == 0xFFFF && comp != 0)
+               lo_score += 8;
+            for (i = 0; i < 21; i++)
+               if (lo_hdr[i] >= 0x20 && lo_hdr[i] <= 0x7E)
+                  lo_score++;
+         }
+
+         /* Score HiROM: map mode byte at header+0x15.
+          * Valid map modes: 0x21 (HiROM), 0x31 (HiROM+FastROM),
+          * 0x35 (ExHiROM). Bit 0 set = HiROM. */
+         {
+            uint8_t map   = hi_hdr[0x15];
+            uint8_t rom_type = hi_hdr[0x16];
+            uint16_t comp = hi_hdr[0x1C] | (hi_hdr[0x1D] << 8);
+            uint16_t csum = hi_hdr[0x1E] | (hi_hdr[0x1F] << 8);
+
+            if ((map & 0x01) == 1 && (map == 0x21 || map == 0x31 || map == 0x35))
+               hi_score += 5;
+            if (rom_type <= 0x03)
+               hi_score += 1;
+            if ((comp ^ csum) == 0xFFFF && comp != 0)
+               hi_score += 8;
+            for (i = 0; i < 21; i++)
+               if (hi_hdr[i] >= 0x20 && hi_hdr[i] <= 0x7E)
+                  hi_score++;
+         }
+
+         /* Tie defaults to LoROM (more common mapping) */
+         winner = (hi_score > lo_score) ? hi_hdr : lo_hdr;
+         memcpy(emulnk_game_serial, winner, 21);
+         emulnk_game_serial[21] = '\0';
+
+         /* Trim trailing spaces */
+         for (i = 20; i >= 0; i--)
+         {
+            if (emulnk_game_serial[i] == ' '
+                  || emulnk_game_serial[i] == '\0')
+               emulnk_game_serial[i] = '\0';
+            else
+               break;
+         }
       }
    }
 }
@@ -1220,6 +1323,10 @@ static void command_handle_emulnk_binary(command_t *handle,
                (struct sockaddr*)&netcmd->cmd_source,
                netcmd->cmd_source_len);
       }
+      else
+         sendto(netcmd->net_fd, "", 0, 0,
+               (struct sockaddr*)&netcmd->cmd_source,
+               netcmd->cmd_source_len);
       return;
    }
 
