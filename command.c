@@ -973,12 +973,141 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
-/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB) */
+/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB) */
 #define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
 
-static char emulnk_game_serial[32]       = {0};
+static char emulnk_game_serial[48]       = {0};
 static bool emulnk_serial_extracted      = false;
 static char emulnk_serial_content[PATH_MAX_LENGTH] = {0};
+
+/**
+ * emulnk_try_genesis_serial:
+ * @fd            : open file stream positioned anywhere
+ * @serial        : output buffer for product code (e.g. "MK-1307")
+ * @serial_len    : size of output buffer
+ *
+ * Reads the Genesis/Mega Drive ROM header to extract the 7-byte product code
+ * from offset 0x183. Handles both normal ROMs and SMD (interleaved) format.
+ * Returns true if a valid Genesis header was found.
+ */
+static bool emulnk_try_genesis_serial(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   int64_t fsize;
+   bool is_smd     = false;
+   uint8_t hdr[144]; /* ROM offsets 0x100..0x18F */
+   int i;
+
+   fsize = intfstream_get_size(fd);
+
+   /* Detect SMD (Super Magic Drive) interleaved format:
+    * 512-byte header + N * 16384-byte interleaved blocks */
+   if (fsize > 512 && ((fsize - 512) % 16384) == 0)
+      is_smd = true;
+
+   /* Minimum size check: need at least up to offset 0x18E (0x100 + 144 - 1) */
+   if (!is_smd && fsize < 0x18E)
+      return false;
+   if (is_smd && fsize < 512 + 16384)
+      return false;
+
+   if (is_smd)
+   {
+      /* SMD interleaving: each 16KB block has even bytes in first 8KB,
+       * odd bytes in second 8KB. To reconstruct ROM bytes 0x100..0x18F
+       * we need 72 even bytes (ROM offsets 0x100,0x102,...,0x18E)
+       * from file offset 512 + 0x80 and 72 odd bytes (ROM offsets
+       * 0x101,0x103,...,0x18F) from file offset 512 + 8192 + 0x80. */
+      uint8_t even_bytes[72];
+      uint8_t odd_bytes[72];
+
+      intfstream_seek(fd, 512 + 0x80, SEEK_SET);
+      if (intfstream_read(fd, even_bytes, 72) != 72)
+         return false;
+
+      intfstream_seek(fd, 512 + 8192 + 0x80, SEEK_SET);
+      if (intfstream_read(fd, odd_bytes, 72) != 72)
+         return false;
+
+      for (i = 0; i < 72; i++)
+      {
+         hdr[i * 2]     = even_bytes[i];
+         hdr[i * 2 + 1] = odd_bytes[i];
+      }
+   }
+   else
+   {
+      intfstream_seek(fd, 0x100, SEEK_SET);
+      if (intfstream_read(fd, hdr, 144) != 144)
+         return false;
+   }
+
+   /* Validate: system type must start with "SEGA" */
+   if (memcmp(hdr, "SEGA", 4) != 0)
+      return false;
+
+   /* Product code is at ROM offset 0x183 = hdr[0x83], 7 bytes
+    * (the serial field at 0x180 is "GM XXXXXXX-YY", code starts at +3) */
+   {
+      size_t copy_len = 7;
+      if (copy_len >= serial_len)
+         copy_len = serial_len - 1;
+      memcpy(serial, &hdr[0x83], copy_len);
+      serial[copy_len] = '\0';
+   }
+
+   /* Trim trailing whitespace */
+   for (i = (int)strlen(serial) - 1; i >= 0; i--)
+   {
+      if (serial[i] == ' ' || serial[i] == '\0')
+         serial[i] = '\0';
+      else
+         break;
+   }
+
+   return true;
+}
+
+/**
+ * emulnk_get_platform_tag:
+ * @ext       : file extension (without dot, e.g. "sfc", "cue")
+ * @core_name : running core's library_name (for .bin/.img disambiguation)
+ *
+ * Returns the platform tag string ("SNES", "Genesis", "PS1") for
+ * 0x00200000 serial responses, or NULL if the extension is unknown.
+ */
+static const char *emulnk_get_platform_tag(const char *ext,
+      const char *core_name)
+{
+   if (   string_is_equal_noncase(ext, "sfc")
+       || string_is_equal_noncase(ext, "smc")
+       || string_is_equal_noncase(ext, "swc")
+       || string_is_equal_noncase(ext, "fig"))
+      return "SNES";
+
+   if (   string_is_equal_noncase(ext, "md")
+       || string_is_equal_noncase(ext, "gen")
+       || string_is_equal_noncase(ext, "smd"))
+      return "Genesis";
+
+   if (   string_is_equal_noncase(ext, "cue")
+       || string_is_equal_noncase(ext, "m3u")
+       || string_is_equal_noncase(ext, "chd")
+       || string_is_equal_noncase(ext, "iso"))
+      return "PS1";
+
+   if (   string_is_equal_noncase(ext, "bin")
+       || string_is_equal_noncase(ext, "img"))
+   {
+      if (   core_name
+          && (   string_is_equal(core_name, "Genesis Plus GX")
+              || string_is_equal(core_name, "Genesis Plus GX Wide")))
+         return "Genesis";
+      return "PS1";
+   }
+
+   return NULL;
+}
 
 static void emulnk_extract_game_serial(void)
 {
@@ -986,7 +1115,11 @@ static void emulnk_extract_game_serial(void)
    const char *real_path    = NULL;
    const char *ext          = NULL;
    content_state_t *p_content = content_state_get_ptr();
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char *core_name    = runloop_st->system.info.library_name;
    uint64_t filesize        = 0; /* required by serial functions, value unused */
+   char raw_serial[32]      = {0};
+   const char *tag;
 
    emulnk_game_serial[0]   = '\0';
    emulnk_serial_extracted  = true;
@@ -1018,26 +1151,31 @@ static void emulnk_extract_game_serial(void)
    if (     string_is_equal_noncase(ext, "cue")
          || string_is_equal_noncase(ext, "m3u"))
       task_database_cue_get_serial(real_path,
-            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+            raw_serial, sizeof(raw_serial), &filesize);
    else if (string_is_equal_noncase(ext, "chd"))
       task_database_chd_get_serial(real_path,
-            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+            raw_serial, sizeof(raw_serial), &filesize);
    else if (string_is_equal_noncase(ext, "iso"))
       intfstream_file_get_serial(real_path, 0, 0,
-            emulnk_game_serial, sizeof(emulnk_game_serial), &filesize);
+            raw_serial, sizeof(raw_serial), &filesize);
    else if (string_is_equal_noncase(ext, "bin")
          || string_is_equal_noncase(ext, "img"))
    {
-      /* For raw .bin/.img disc images, detect_system() fails because the
-       * magic byte offsets assume 2048-byte sectors, but raw CD images use
-       * 2352-byte sectors. Call detect_ps1_game() directly — it scans the
-       * raw bytes for serial patterns and handles both sector sizes. */
+      /* .bin/.img is ambiguous: could be a raw CD image (PS1) or a Genesis ROM.
+       * Use the running core's library_name to pick the right detector. */
       intfstream_t *fd = intfstream_open_file(real_path,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
       if (fd)
       {
-         detect_ps1_game(fd, emulnk_game_serial,
-               sizeof(emulnk_game_serial), real_path);
+         if (   core_name
+             && (   string_is_equal(core_name, "Genesis Plus GX")
+                 || string_is_equal(core_name, "Genesis Plus GX Wide")))
+            emulnk_try_genesis_serial(fd, raw_serial,
+                  sizeof(raw_serial));
+         else
+            detect_ps1_game(fd, raw_serial,
+                  sizeof(raw_serial), real_path);
+
          intfstream_close(fd);
          free(fd);
       }
@@ -1130,19 +1268,47 @@ static void emulnk_extract_game_serial(void)
 
          /* Tie defaults to LoROM (more common mapping) */
          winner = (hi_score > lo_score) ? hi_hdr : lo_hdr;
-         memcpy(emulnk_game_serial, winner, 21);
-         emulnk_game_serial[21] = '\0';
+         memcpy(raw_serial, winner, 21);
+         raw_serial[21] = '\0';
 
          /* Trim trailing spaces */
          for (i = 20; i >= 0; i--)
          {
-            if (emulnk_game_serial[i] == ' '
-                  || emulnk_game_serial[i] == '\0')
-               emulnk_game_serial[i] = '\0';
+            if (raw_serial[i] == ' '
+                  || raw_serial[i] == '\0')
+               raw_serial[i] = '\0';
             else
                break;
          }
       }
+   }
+   else if (string_is_equal_noncase(ext, "md")
+         || string_is_equal_noncase(ext, "gen")
+         || string_is_equal_noncase(ext, "smd"))
+   {
+      /* Genesis/Mega Drive ROM: Genesis Plus GX does not expose cartridge ROM
+       * via memory maps or RETRO_MEMORY_ROM — extract serial from file. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_genesis_serial(fd, raw_serial,
+               sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+
+   /* Prefix with platform tag for 0x00200000 disambiguation */
+   if (raw_serial[0] != '\0')
+   {
+      tag = emulnk_get_platform_tag(ext, core_name);
+      if (tag)
+         snprintf(emulnk_game_serial, sizeof(emulnk_game_serial),
+               "%s:%s", tag, raw_serial);
+      else
+         strlcpy(emulnk_game_serial, raw_serial,
+               sizeof(emulnk_game_serial));
    }
 }
 #endif
