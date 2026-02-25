@@ -29,6 +29,7 @@
 #include <streams/stdin_stream.h>
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
+#include <encodings/crc32.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -973,7 +974,7 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
-/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB) */
+/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB, NES=2KB) */
 #define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
 
 static char emulnk_game_serial[48]       = {0};
@@ -1069,6 +1070,72 @@ static bool emulnk_try_genesis_serial(intfstream_t *fd,
 }
 
 /**
+ * emulnk_try_nes_crc32:
+ * @fd            : open file stream positioned anywhere
+ * @serial        : output buffer for CRC32 hex string (e.g. "A44F8120")
+ * @serial_len    : size of output buffer (must be >= 9)
+ *
+ * Validates iNES magic ("NES\x1A"), skips the 16-byte header and optional
+ * 512-byte trainer, then computes CRC32 of the remaining ROM data (PRG+CHR)
+ * in 4KB chunks. Writes an 8-character uppercase hex string to @serial.
+ * Returns false for non-iNES files (FDS, UNIF) or files too small.
+ */
+static bool emulnk_try_nes_crc32(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   uint8_t hdr[16];
+   int64_t fsize;
+   int64_t data_offset;
+   int64_t data_size;
+   uint32_t crc = 0;
+   uint8_t buf[4096];
+
+   if (serial_len < 9)
+      return false;
+
+   fsize = intfstream_get_size(fd);
+   if (fsize < 16)
+      return false;
+
+   intfstream_seek(fd, 0, SEEK_SET);
+   if (intfstream_read(fd, hdr, 16) != 16)
+      return false;
+
+   /* Validate iNES magic: "NES\x1A" */
+   if (   hdr[0] != 'N'
+       || hdr[1] != 'E'
+       || hdr[2] != 'S'
+       || hdr[3] != 0x1A)
+      return false;
+
+   /* Skip header (16 bytes) + optional 512-byte trainer (bit 2 of flags 6) */
+   data_offset = 16;
+   if (hdr[6] & 0x04)
+      data_offset += 512;
+
+   data_size = fsize - data_offset;
+   if (data_size <= 0)
+      return false;
+
+   intfstream_seek(fd, data_offset, SEEK_SET);
+
+   /* Compute CRC32 in 4KB chunks */
+   while (data_size > 0)
+   {
+      int64_t chunk = (data_size > (int64_t)sizeof(buf))
+         ? (int64_t)sizeof(buf) : data_size;
+      int64_t nread = intfstream_read(fd, buf, (size_t)chunk);
+      if (nread <= 0)
+         break;
+      crc = encoding_crc32(crc, buf, (size_t)nread);
+      data_size -= nread;
+   }
+
+   snprintf(serial, serial_len, "%08X", (unsigned)crc);
+   return true;
+}
+
+/**
  * emulnk_get_platform_tag:
  * @ext       : file extension (without dot, e.g. "sfc", "cue")
  * @core_name : running core's library_name (for .bin/.img disambiguation)
@@ -1084,6 +1151,12 @@ static const char *emulnk_get_platform_tag(const char *ext,
        || string_is_equal_noncase(ext, "swc")
        || string_is_equal_noncase(ext, "fig"))
       return "SNES";
+
+   if (   string_is_equal_noncase(ext, "nes")
+       || string_is_equal_noncase(ext, "fds")
+       || string_is_equal_noncase(ext, "unf")
+       || string_is_equal_noncase(ext, "unif"))
+      return "NES";
 
    if (   string_is_equal_noncase(ext, "md")
        || string_is_equal_noncase(ext, "gen")
@@ -1293,6 +1366,24 @@ static void emulnk_extract_game_serial(void)
       if (fd)
       {
          emulnk_try_genesis_serial(fd, raw_serial,
+               sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+   else if (string_is_equal_noncase(ext, "nes")
+         || string_is_equal_noncase(ext, "fds")
+         || string_is_equal_noncase(ext, "unf")
+         || string_is_equal_noncase(ext, "unif"))
+   {
+      /* NES ROM: Mesen does not expose PRG ROM via memory maps — compute
+       * CRC32 of the ROM data (excluding iNES header) as the identifier.
+       * FDS/UNIF files will fail iNES magic validation and return empty. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_nes_crc32(fd, raw_serial,
                sizeof(raw_serial));
          intfstream_close(fd);
          free(fd);
