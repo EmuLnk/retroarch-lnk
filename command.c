@@ -974,7 +974,9 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
-/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB, GB/GBC=32KB, NES=2KB) */
+/* N64 RDRAM (4-8MB) overlaps this address but the handler intercepts
+ * it before memory resolution (PS1=2MB, SNES=128KB, GBA=256KB,
+ * Genesis=64KB, GB/GBC=32KB, NES=2KB) */
 #define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
 
 static char emulnk_game_serial[48]       = {0};
@@ -1186,6 +1188,76 @@ static bool emulnk_try_gb_title(intfstream_t *fd,
 }
 
 /**
+ * emulnk_try_n64_serial:
+ * @fd            : open file stream positioned anywhere
+ * @serial        : output buffer for game code (e.g. "NSME")
+ * @serial_len    : size of output buffer
+ *
+ * Reads the N64 ROM header (64 bytes) and extracts the 4-byte game code
+ * at offset 0x3B-0x3E (media format + cartridge ID + country code).
+ * Detects byte ordering from the first byte and normalizes to big-endian:
+ *   0x80 = .z64 (native big-endian, no swap needed)
+ *   0x37 = .v64 (16-bit byte-swapped)
+ *   0x40 = .n64 (32-bit byte-swapped)
+ * Returns true if a valid 4-byte printable ASCII game code was found.
+ */
+static bool emulnk_try_n64_serial(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   uint8_t hdr[64];
+   int i;
+
+   if (serial_len < 5)
+      return false;
+
+   if (intfstream_get_size(fd) < 64)
+      return false;
+
+   intfstream_seek(fd, 0, SEEK_SET);
+   if (intfstream_read(fd, hdr, 64) != 64)
+      return false;
+
+   /* Detect byte ordering and swap to big-endian */
+   if (hdr[0] == 0x37)
+   {
+      /* .v64: 16-bit byte-swapped — swap every pair */
+      for (i = 0; i < 64; i += 2)
+      {
+         uint8_t tmp = hdr[i];
+         hdr[i]      = hdr[i + 1];
+         hdr[i + 1]  = tmp;
+      }
+   }
+   else if (hdr[0] == 0x40)
+   {
+      /* .n64: 32-bit byte-swapped — reverse every 4-byte group */
+      for (i = 0; i < 64; i += 4)
+      {
+         uint8_t tmp0 = hdr[i];
+         uint8_t tmp1 = hdr[i + 1];
+         hdr[i]       = hdr[i + 3];
+         hdr[i + 1]   = hdr[i + 2];
+         hdr[i + 2]   = tmp1;
+         hdr[i + 3]   = tmp0;
+      }
+   }
+   else if (hdr[0] != 0x80)
+      return false; /* unknown byte ordering */
+
+   /* Extract 4-byte game code at 0x3B-0x3E */
+   for (i = 0; i < 4; i++)
+   {
+      uint8_t c = hdr[0x3B + i];
+      if (c < 0x20 || c > 0x7E)
+         return false;
+      serial[i] = (char)c;
+   }
+   serial[4] = '\0';
+
+   return true;
+}
+
+/**
  * emulnk_get_platform_tag:
  * @ext       : file extension (without dot, e.g. "sfc", "cue")
  * @core_name : running core's library_name (for .bin/.img disambiguation)
@@ -1212,6 +1284,11 @@ static const char *emulnk_get_platform_tag(const char *ext,
       return "GB";
    if (string_is_equal_noncase(ext, "gbc"))
       return "GBC";
+
+   if (   string_is_equal_noncase(ext, "z64")
+       || string_is_equal_noncase(ext, "n64")
+       || string_is_equal_noncase(ext, "v64"))
+      return "N64";
 
    if (   string_is_equal_noncase(ext, "md")
        || string_is_equal_noncase(ext, "gen")
@@ -1458,6 +1535,21 @@ static void emulnk_extract_game_serial(void)
          free(fd);
       }
    }
+   else if (string_is_equal_noncase(ext, "z64")
+         || string_is_equal_noncase(ext, "n64")
+         || string_is_equal_noncase(ext, "v64"))
+   {
+      /* Mupen64Plus-Next does not expose ROM via memory API;
+       * read the 4-byte game code from the file header. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_n64_serial(fd, raw_serial, sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
 
    /* Prefix with platform tag for 0x00200000 disambiguation */
    if (raw_serial[0] != '\0')
@@ -1539,6 +1631,12 @@ static uint8_t *command_memory_get_pointer(
       meminfo.id = RETRO_MEMORY_SYSTEM_RAM;
       if (core_get_memory(&meminfo) && meminfo.data && meminfo.size > 0)
       {
+         /* Strip virtual address bits so callers can use native addresses
+          * (e.g. N64 kseg0 0x80XXXXXX → physical 0x00XXXXXX).
+          * Mirrors the masking in dolphin-lnk's EmuLinkServer.cpp. */
+         if (address >= meminfo.size && address >= 0x20000000)
+            address &= 0x1FFFFFFF;
+
          if (address < meminfo.size)
          {
             *max_bytes = (unsigned int)(meminfo.size - address);
