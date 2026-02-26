@@ -974,7 +974,7 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
-/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB, NES=2KB) */
+/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB, GB/GBC=32KB, NES=2KB) */
 #define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
 
 static char emulnk_game_serial[48]       = {0};
@@ -1136,6 +1136,56 @@ static bool emulnk_try_nes_crc32(intfstream_t *fd,
 }
 
 /**
+ * emulnk_try_gb_title:
+ * @fd            : open file stream positioned anywhere
+ * @serial        : output buffer for ROM title
+ * @serial_len    : size of output buffer
+ *
+ * Reads the Game Boy / Game Boy Color ROM title from offset 0x0134.
+ * CGB flag at 0x0143: if 0x80 or 0xC0 the title field is 11 bytes,
+ * otherwise up to 15 bytes. Trims trailing NULs and spaces.
+ * Returns true if a non-empty title was found.
+ */
+static bool emulnk_try_gb_title(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   uint8_t buf[16]; /* bytes 0x0134..0x0143 */
+   int title_len;
+   int i;
+
+   if (serial_len < 16)
+      return false;
+
+   if (intfstream_get_size(fd) < 0x0144)
+      return false;
+
+   intfstream_seek(fd, 0x0134, SEEK_SET);
+   if (intfstream_read(fd, buf, 16) != 16)
+      return false;
+
+   /* CGB flag at 0x0143 (buf[15]): 0x80 = CGB compatible,
+    * 0xC0 = CGB only → title is 11 bytes; otherwise 15. */
+   title_len = (buf[15] == 0x80 || buf[15] == 0xC0) ? 11 : 15;
+
+   if ((size_t)title_len >= serial_len)
+      title_len = (int)serial_len - 1;
+
+   memcpy(serial, buf, title_len);
+   serial[title_len] = '\0';
+
+   /* Trim trailing NULs and spaces */
+   for (i = title_len - 1; i >= 0; i--)
+   {
+      if (serial[i] == '\0' || serial[i] == ' ')
+         serial[i] = '\0';
+      else
+         break;
+   }
+
+   return serial[0] != '\0';
+}
+
+/**
  * emulnk_get_platform_tag:
  * @ext       : file extension (without dot, e.g. "sfc", "cue")
  * @core_name : running core's library_name (for .bin/.img disambiguation)
@@ -1157,6 +1207,11 @@ static const char *emulnk_get_platform_tag(const char *ext,
        || string_is_equal_noncase(ext, "unf")
        || string_is_equal_noncase(ext, "unif"))
       return "NES";
+
+   if (string_is_equal_noncase(ext, "gb"))
+      return "GB";
+   if (string_is_equal_noncase(ext, "gbc"))
+      return "GBC";
 
    if (   string_is_equal_noncase(ext, "md")
        || string_is_equal_noncase(ext, "gen")
@@ -1385,6 +1440,20 @@ static void emulnk_extract_game_serial(void)
       {
          emulnk_try_nes_crc32(fd, raw_serial,
                sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+   else if (string_is_equal_noncase(ext, "gb")
+         || string_is_equal_noncase(ext, "gbc"))
+   {
+      /* Gambatte exposes ROM via memory descriptors but the title field
+       * is shorter/more reliable to read directly from the file header. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_gb_title(fd, raw_serial, sizeof(raw_serial));
          intfstream_close(fd);
          free(fd);
       }
