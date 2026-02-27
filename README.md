@@ -1,3 +1,43 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/EmuLnk/emulnk/master/.github/assets/logo.svg" alt="EmuLnk" width="80"/>
+</p>
+
+<p align="center">
+  <strong>EmuLnk fork of RetroArch</strong><br/>
+  Adds the binary UDP protocol for live game data on a second screen.
+</p>
+
+<p align="center">
+  <a href="https://github.com/EmuLnk/emulnk"><img src="https://img.shields.io/badge/Main_Project-EmuLnk-B47CFF?style=for-the-badge&logo=github&logoColor=white" alt="EmuLnk"/></a>
+  &nbsp;
+  <a href="https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/https://github.com/EmuLnk/retroarch-lnk"><img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" height="28" alt="Get it on Obtainium"/></a>
+</p>
+
+## Supported Cores
+
+| System | Core | ID Method |
+|--------|------|-----------|
+| SNES | snes9x, snes9x2010, bsnes-mercury | ROM header from file |
+| NES | Mesen | CRC32 of ROM data |
+| Genesis | Genesis Plus GX | ROM header from file |
+| GB | Gambatte | ROM title from file |
+| GBC | Gambatte | ROM title from file |
+| GBA | mGBA | Memory map descriptors |
+| N64 | Mupen64Plus-Next | ROM header from file |
+| PS1 | SwanStation | System RAM fallback |
+
+## Project Repos
+
+| Repo | Description |
+|------|-------------|
+| [`emulnk`](https://github.com/EmuLnk/emulnk) | Android companion app |
+| [`emulnk-repo`](https://github.com/EmuLnk/emulnk-repo) | Themes, profiles, and system configs |
+| **`retroarch-lnk`** | **RetroArch fork with UDP protocol** |
+| [`dolphin-lnk`](https://github.com/EmuLnk/dolphin-lnk) | Dolphin fork with UDP protocol |
+| [`ppsspp-lnk`](https://github.com/EmuLnk/ppsspp-lnk) | PPSSPP fork with UDP protocol |
+
+---
+
 [![Build Status](https://travis-ci.org/libretro/RetroArch.svg?branch=master)](https://travis-ci.org/libretro/RetroArch)
 [![Coverity Scan Build Status](https://scan.coverity.com/projects/8936/badge.svg)](https://scan.coverity.com/projects/retroarch)
 [![Crowdin](https://badges.crowdin.net/retroarch/localized.svg)](https://crowdin.com/project/retroarch)
