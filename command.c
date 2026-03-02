@@ -234,6 +234,18 @@ static void command_network_poll(command_t *handle)
                   &netcmd->cmd_source_len)) <= 0)
          return;
 
+      /* IDENTIFY handshake: 4-byte "EMLK" magic → respond with emulator name */
+      if (ret == 4 &&
+          buf[0] == 'E' && buf[1] == 'M' &&
+          buf[2] == 'L' && buf[3] == 'K')
+      {
+         const char *id = "retroarch";
+         sendto(netcmd->net_fd, id, 9, 0,
+                (struct sockaddr*)&netcmd->cmd_source,
+                netcmd->cmd_source_len);
+         continue;
+      }
+
       /* EmuLnk binary protocol detection: the first 4 bytes encode a
        * LE memory address which always contains at least one
        * non-printable byte. Text commands are pure printable ASCII. */
