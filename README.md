@@ -22,7 +22,7 @@
 | Genesis | Genesis Plus GX | ROM header from file |
 | GB | Gambatte | ROM title from file |
 | GBC | Gambatte | ROM title from file |
-| GBA | mGBA | Memory map descriptors |
+| GBA | mGBA | Game code from file |
 | N64 | Mupen64Plus-Next | ROM header from file |
 | PS1 | SwanStation | System RAM fallback |
 

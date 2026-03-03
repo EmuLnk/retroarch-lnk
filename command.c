@@ -1198,6 +1198,121 @@ static bool emulnk_try_gb_title(intfstream_t *fd,
 }
 
 /**
+ * emulnk_try_gba_code:
+ * @fd         : open file stream positioned at beginning of GBA ROM
+ * @serial     : output buffer for the 4-byte game code
+ * @serial_len : size of output buffer (must be >= 5)
+ *
+ * Extracts the 4-byte game code from offset 0xAC in the GBA ROM header
+ * (e.g., "AXVE" for Pokemon Ruby USA). Validates the fixed byte 0x96
+ * at offset 0xB2 to confirm it's a genuine GBA ROM.
+ */
+static bool emulnk_try_gba_code(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   uint8_t code[4];
+   uint8_t fixed_byte;
+   int i;
+
+   if (serial_len < 5)
+      return false;
+
+   if (intfstream_get_size(fd) < 0xB3)
+      return false;
+
+   /* Read 4-byte game code at offset 0xAC */
+   intfstream_seek(fd, 0xAC, SEEK_SET);
+   if (intfstream_read(fd, code, 4) != 4)
+      return false;
+
+   /* Validate fixed byte 0x96 at offset 0xB2 */
+   intfstream_seek(fd, 0xB2, SEEK_SET);
+   if (intfstream_read(fd, &fixed_byte, 1) != 1)
+      return false;
+   if (fixed_byte != 0x96)
+      return false;
+
+   /* Validate all 4 bytes are printable ASCII */
+   for (i = 0; i < 4; i++)
+      if (code[i] < 0x20 || code[i] > 0x7E)
+         return false;
+
+   memcpy(serial, code, 4);
+   serial[4] = '\0';
+   return true;
+}
+
+/**
+ * emulnk_try_n64_serial:
+ * @fd         : open file stream positioned at beginning of N64 ROM
+ * @serial     : output buffer for the 4-byte cartridge ID
+ * @serial_len : size of output buffer (must be >= 5)
+ *
+ * Extracts the 4-byte cartridge ID from bytes 0x3B..0x3E of the N64 ROM
+ * header in big-endian (z64) format. Handles three ROM byte orderings:
+ *   .z64 (80 37 12 40) — native big-endian, no swap needed
+ *   .v64 (37 80 40 12) — byte-swap each 16-bit word
+ *   .n64 (40 12 37 80) — reverse each 32-bit word
+ */
+static bool emulnk_try_n64_serial(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   uint8_t hdr[64];
+   int i;
+
+   if (serial_len < 5)
+      return false;
+
+   if (intfstream_get_size(fd) < 64)
+      return false;
+
+   intfstream_seek(fd, 0, SEEK_SET);
+   if (intfstream_read(fd, hdr, 64) != 64)
+      return false;
+
+   /* Detect byte ordering from magic bytes at offset 0 and convert
+    * the entire 64-byte header to big-endian (z64) in-place. */
+   if (hdr[0] == 0x80 && hdr[1] == 0x37)
+   {
+      /* .z64 — already big-endian, nothing to do */
+   }
+   else if (hdr[0] == 0x37 && hdr[1] == 0x80)
+   {
+      /* .v64 — swap each pair of bytes */
+      for (i = 0; i < 64; i += 2)
+      {
+         uint8_t tmp = hdr[i];
+         hdr[i]      = hdr[i + 1];
+         hdr[i + 1]  = tmp;
+      }
+   }
+   else if (hdr[0] == 0x40 && hdr[1] == 0x12)
+   {
+      /* .n64 — reverse each 4-byte word */
+      for (i = 0; i < 64; i += 4)
+      {
+         uint8_t tmp0 = hdr[i];
+         uint8_t tmp1 = hdr[i + 1];
+         hdr[i]       = hdr[i + 3];
+         hdr[i + 1]   = hdr[i + 2];
+         hdr[i + 2]   = tmp1;
+         hdr[i + 3]   = tmp0;
+      }
+   }
+   else
+      return false; /* unknown ROM format */
+
+   /* Extract 4-byte cartridge ID at offset 0x3B..0x3E */
+   for (i = 0; i < 4; i++)
+      if (hdr[0x3B + i] < 0x20 || hdr[0x3B + i] > 0x7E)
+         return false;
+
+   memcpy(serial, &hdr[0x3B], 4);
+   serial[4] = '\0';
+   return true;
+}
+
+/**
  * emulnk_get_platform_tag:
  * @ext       : file extension (without dot, e.g. "sfc", "cue")
  * @core_name : running core's library_name (for .bin/.img disambiguation)
@@ -1224,6 +1339,14 @@ static const char *emulnk_get_platform_tag(const char *ext,
       return "GB";
    if (string_is_equal_noncase(ext, "gbc"))
       return "GBC";
+
+   if (string_is_equal_noncase(ext, "gba"))
+      return "GBA";
+
+   if (   string_is_equal_noncase(ext, "n64")
+       || string_is_equal_noncase(ext, "z64")
+       || string_is_equal_noncase(ext, "v64"))
+      return "N64";
 
    if (   string_is_equal_noncase(ext, "md")
        || string_is_equal_noncase(ext, "gen")
@@ -1466,6 +1589,33 @@ static void emulnk_extract_game_serial(void)
       if (fd)
       {
          emulnk_try_gb_title(fd, raw_serial, sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+   else if (string_is_equal_noncase(ext, "gba"))
+   {
+      /* GBA ROM: extract 4-byte game code from header offset 0xAC. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_gba_code(fd, raw_serial, sizeof(raw_serial));
+         intfstream_close(fd);
+         free(fd);
+      }
+   }
+   else if (string_is_equal_noncase(ext, "n64")
+         || string_is_equal_noncase(ext, "z64")
+         || string_is_equal_noncase(ext, "v64"))
+   {
+      /* N64 ROM: extract 4-byte cartridge ID from header, handling
+       * z64/v64/n64 byte ordering variants. */
+      intfstream_t *fd = intfstream_open_file(real_path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (fd)
+      {
+         emulnk_try_n64_serial(fd, raw_serial, sizeof(raw_serial));
          intfstream_close(fd);
          free(fd);
       }
