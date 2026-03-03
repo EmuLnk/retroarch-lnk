@@ -1623,7 +1623,7 @@ static void command_handle_emulnk_binary(command_t *handle,
    /* Virtual address: game serial extracted from disc image */
    if (address == EMULNK_VIRTUAL_GAME_SERIAL_ADDR && len == 8)
    {
-      if (!emulnk_serial_extracted)
+      if (!emulnk_serial_extracted || emulnk_game_serial[0] == '\0')
          emulnk_extract_game_serial();
       if (emulnk_game_serial[0] != '\0')
       {
