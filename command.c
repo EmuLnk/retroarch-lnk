@@ -18,6 +18,9 @@
 #include "input/input_driver.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef ANDROID
+#include <android/log.h>
+#endif
 #include <stddef.h>
 #include <locale.h>
 #ifdef HAVE_NETWORKING
@@ -30,6 +33,8 @@
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <encodings/crc32.h>
+#include <file/archive_file.h>
+#include <lrc_hash.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -212,9 +217,21 @@ static void network_command_free(command_t *handle)
    free(handle);
 }
 
-/* Forward declaration — implementation after command_memory_get_pointer() */
+/* Forward declarations — implementations after command_memory_get_pointer() */
 static void command_handle_emulnk_binary(command_t *handle,
       const uint8_t *buf, ssize_t len);
+static void emulnk_extract_game_serial(void);
+static void emulnk_compute_game_hash(void);
+static bool emulnk_try_snes_serial(intfstream_t *fd,
+      char *serial, size_t serial_len);
+
+static char emulnk_game_serial[48]       = {0};
+static bool emulnk_serial_extracted      = false;
+static char emulnk_serial_content[PATH_MAX_LENGTH] = {0};
+
+static char emulnk_game_hash[33]         = {0};  /* 32 hex chars + NUL */
+static bool emulnk_hash_computed         = false;
+static char emulnk_hash_content[PATH_MAX_LENGTH] = {0};
 
 static void command_network_poll(command_t *handle)
 {
@@ -234,13 +251,56 @@ static void command_network_poll(command_t *handle)
                   &netcmd->cmd_source_len)) <= 0)
          return;
 
-      /* IDENTIFY handshake: 4-byte "EMLK" magic → respond with emulator name */
-      if (ret == 4 &&
+      /* IDENTIFY V2 handshake: 6-byte "EMLKV2" magic → respond with JSON */
+      if (ret == 6 &&
           buf[0] == 'E' && buf[1] == 'M' &&
-          buf[2] == 'L' && buf[3] == 'K')
+          buf[2] == 'L' && buf[3] == 'K' &&
+          buf[4] == 'V' && buf[5] == '2')
       {
-         const char *id = "retroarch";
-         sendto(netcmd->net_fd, id, 9, 0,
+         char json[512];
+         const char *game_id;
+         const char *platform;
+         const char *colon;
+         char plat_buf[16];
+
+         /* Invalidate caches if content path changed (ROM swap) */
+         {
+            const char *cur_path = path_get(RARCH_PATH_CONTENT);
+            if (emulnk_serial_extracted
+                && (string_is_empty(cur_path)
+                    || !string_is_equal(cur_path, emulnk_serial_content)))
+               emulnk_serial_extracted = false;
+            if (emulnk_hash_computed
+                && (string_is_empty(cur_path)
+                    || !string_is_equal(cur_path, emulnk_hash_content)))
+               emulnk_hash_computed = false;
+         }
+
+         if (!emulnk_serial_extracted || emulnk_game_serial[0] == '\0')
+            emulnk_extract_game_serial();
+         if (!emulnk_hash_computed || emulnk_game_hash[0] == '\0')
+            emulnk_compute_game_hash();
+
+         game_id  = emulnk_game_serial;
+         platform = "";
+         colon    = strchr(emulnk_game_serial, ':');
+         if (colon)
+         {
+            size_t plen = (size_t)(colon - emulnk_game_serial);
+            if (plen >= sizeof(plat_buf))
+               plen = sizeof(plat_buf) - 1;
+            memcpy(plat_buf, emulnk_game_serial, plen);
+            plat_buf[plen] = '\0';
+            platform = plat_buf;
+            game_id  = colon + 1;
+         }
+
+         snprintf(json, sizeof(json),
+            "{\"emulator\":\"retroarch\",\"game_id\":\"%s\","
+            "\"game_hash\":\"%s\",\"platform\":\"%s\"}",
+            game_id, emulnk_game_hash, platform);
+
+         sendto(netcmd->net_fd, json, strlen(json), 0,
                 (struct sockaddr*)&netcmd->cmd_source,
                 netcmd->cmd_source_len);
          continue;
@@ -986,13 +1046,6 @@ bool command_load_core(command_t *cmd, const char* arg)
 }
 
 #if defined(HAVE_NETWORK_CMD)
-/* Beyond system RAM of all supported cores (PS1=2MB, SNES=128KB, GBA=256KB, Genesis=64KB, GB/GBC=32KB, NES=2KB) */
-#define EMULNK_VIRTUAL_GAME_SERIAL_ADDR 0x00200000
-
-static char emulnk_game_serial[48]       = {0};
-static bool emulnk_serial_extracted      = false;
-static char emulnk_serial_content[PATH_MAX_LENGTH] = {0};
-
 /**
  * emulnk_try_genesis_serial:
  * @fd            : open file stream positioned anywhere
@@ -1318,7 +1371,7 @@ static bool emulnk_try_n64_serial(intfstream_t *fd,
  * @core_name : running core's library_name (for .bin/.img disambiguation)
  *
  * Returns the platform tag string ("SNES", "Genesis", "PS1") for
- * 0x00200000 serial responses, or NULL if the extension is unknown.
+ * serial disambiguation, or NULL if the extension is unknown.
  */
 static const char *emulnk_get_platform_tag(const char *ext,
       const char *core_name)
@@ -1372,6 +1425,109 @@ static const char *emulnk_get_platform_tag(const char *ext,
    return NULL;
 }
 
+/**
+ * emulnk_try_snes_serial:
+ * @fd            : open file stream positioned anywhere
+ * @serial        : output buffer for internal ROM name
+ * @serial_len    : size of output buffer
+ *
+ * Reads the SNES ROM header to extract the 21-byte internal ROM name.
+ * Detects LoROM vs HiROM by scoring both potential header locations.
+ * Handles optional 512-byte copier header.
+ * Returns true if a valid SNES header was found.
+ */
+static bool emulnk_try_snes_serial(intfstream_t *fd,
+      char *serial, size_t serial_len)
+{
+   int64_t fsize       = intfstream_get_size(fd);
+   int copier_offset   = (fsize % 1024 == 512) ? 512 : 0;
+   uint8_t lo_hdr[32]  = {0};
+   uint8_t hi_hdr[32]  = {0};
+   int lo_score        = 0;
+   int hi_score        = 0;
+   const uint8_t *winner;
+   int i;
+
+   if (fsize < copier_offset + 0x8000) /* too small for valid SNES ROM */
+      return false;
+
+   /* Read LoROM header candidate at file offset $7FC0 */
+   if (fsize >= copier_offset + 0x7FC0 + 32)
+   {
+      intfstream_seek(fd, copier_offset + 0x7FC0, SEEK_SET);
+      intfstream_read(fd, lo_hdr, 32);
+   }
+
+   /* Read HiROM header candidate at file offset $FFC0 */
+   if (fsize >= copier_offset + 0xFFC0 + 32)
+   {
+      intfstream_seek(fd, copier_offset + 0xFFC0, SEEK_SET);
+      intfstream_read(fd, hi_hdr, 32);
+   }
+
+   /* Score LoROM: map mode byte at header+0x15.
+    * Valid map modes: 0x20 (LoROM), 0x30 (LoROM+FastROM).
+    * Bit 0 clear = LoROM. */
+   {
+      uint8_t map      = lo_hdr[0x15];
+      uint8_t rom_type = lo_hdr[0x16];
+      uint16_t comp    = lo_hdr[0x1C] | (lo_hdr[0x1D] << 8);
+      uint16_t csum    = lo_hdr[0x1E] | (lo_hdr[0x1F] << 8);
+
+      if ((map & 0x01) == 0 && (map == 0x20 || map == 0x30))
+         lo_score += 5;
+      if (rom_type <= 0x03)
+         lo_score += 1;
+      if ((comp ^ csum) == 0xFFFF && comp != 0)
+         lo_score += 8;
+      for (i = 0; i < 21; i++)
+         if (lo_hdr[i] >= 0x20 && lo_hdr[i] <= 0x7E)
+            lo_score++;
+   }
+
+   /* Score HiROM: map mode byte at header+0x15.
+    * Valid map modes: 0x21 (HiROM), 0x31 (HiROM+FastROM),
+    * 0x35 (ExHiROM). Bit 0 set = HiROM. */
+   {
+      uint8_t map      = hi_hdr[0x15];
+      uint8_t rom_type = hi_hdr[0x16];
+      uint16_t comp    = hi_hdr[0x1C] | (hi_hdr[0x1D] << 8);
+      uint16_t csum    = hi_hdr[0x1E] | (hi_hdr[0x1F] << 8);
+
+      if ((map & 0x01) == 1 && (map == 0x21 || map == 0x31 || map == 0x35))
+         hi_score += 5;
+      if (rom_type <= 0x03)
+         hi_score += 1;
+      if ((comp ^ csum) == 0xFFFF && comp != 0)
+         hi_score += 8;
+      for (i = 0; i < 21; i++)
+         if (hi_hdr[i] >= 0x20 && hi_hdr[i] <= 0x7E)
+            hi_score++;
+   }
+
+   /* Tie defaults to LoROM (more common mapping) */
+   winner = (hi_score > lo_score) ? hi_hdr : lo_hdr;
+
+   {
+      size_t copy_len = 21;
+      if (copy_len >= serial_len)
+         copy_len = serial_len - 1;
+      memcpy(serial, winner, copy_len);
+      serial[copy_len] = '\0';
+   }
+
+   /* Trim trailing spaces */
+   for (i = 20; i >= 0; i--)
+   {
+      if (serial[i] == ' ' || serial[i] == '\0')
+         serial[i] = '\0';
+      else
+         break;
+   }
+
+   return true;
+}
+
 static void emulnk_extract_game_serial(void)
 {
    const char *content_path = path_get(RARCH_PATH_CONTENT);
@@ -1411,6 +1567,64 @@ static void emulnk_extract_game_serial(void)
    if (string_is_empty(ext))
       return;
 
+#ifdef HAVE_ZLIB
+   /* --- Archive path (e.g. game.zip#rom.gba): extract to memory --- */
+   if (path_contains_compressed_file(real_path))
+   {
+      void *arc_buf       = NULL;
+      int64_t arc_len     = 0;
+      const char *arc_delim;
+      intfstream_t *fd;
+
+      if (!file_archive_compressed_read(real_path,
+            &arc_buf, NULL, &arc_len) || !arc_buf || arc_len <= 0)
+      {
+         free(arc_buf);
+         goto add_tag;
+      }
+
+      /* Resolve inner file extension from path after '#' */
+      arc_delim = path_get_archive_delim(real_path);
+      if (arc_delim)
+         ext = path_get_extension(arc_delim + 1);
+
+      fd = intfstream_open_memory(arc_buf,
+            RETRO_VFS_FILE_ACCESS_READ,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE, (uint64_t)arc_len);
+      if (fd)
+      {
+         if (string_is_equal_noncase(ext, "gba"))
+            emulnk_try_gba_code(fd, raw_serial, sizeof(raw_serial));
+         else if (string_is_equal_noncase(ext, "sfc")
+               || string_is_equal_noncase(ext, "smc")
+               || string_is_equal_noncase(ext, "swc")
+               || string_is_equal_noncase(ext, "fig"))
+            emulnk_try_snes_serial(fd, raw_serial, sizeof(raw_serial));
+         else if (string_is_equal_noncase(ext, "md")
+               || string_is_equal_noncase(ext, "gen")
+               || string_is_equal_noncase(ext, "smd"))
+            emulnk_try_genesis_serial(fd, raw_serial, sizeof(raw_serial));
+         else if (string_is_equal_noncase(ext, "nes")
+               || string_is_equal_noncase(ext, "fds")
+               || string_is_equal_noncase(ext, "unf")
+               || string_is_equal_noncase(ext, "unif"))
+            emulnk_try_nes_crc32(fd, raw_serial, sizeof(raw_serial));
+         else if (string_is_equal_noncase(ext, "gb")
+               || string_is_equal_noncase(ext, "gbc"))
+            emulnk_try_gb_title(fd, raw_serial, sizeof(raw_serial));
+         else if (string_is_equal_noncase(ext, "n64")
+               || string_is_equal_noncase(ext, "z64")
+               || string_is_equal_noncase(ext, "v64"))
+            emulnk_try_n64_serial(fd, raw_serial, sizeof(raw_serial));
+
+         intfstream_close(fd);
+         free(fd);
+      }
+      free(arc_buf);
+      goto add_tag;
+   }
+#endif
+
    if (     string_is_equal_noncase(ext, "cue")
          || string_is_equal_noncase(ext, "m3u"))
       task_database_cue_get_serial(real_path,
@@ -1448,101 +1662,13 @@ static void emulnk_extract_game_serial(void)
          || string_is_equal_noncase(ext, "swc")
          || string_is_equal_noncase(ext, "fig"))
    {
-      /* SNES ROM: snes9x does not expose ROM via memory maps
-       * (no SET_MEMORY_MAPS and ROM is commented out in retro_get_memory_data),
-       * so extract the internal ROM name directly from the file.
-       * Detect LoROM vs HiROM by scoring both potential header locations. */
       intfstream_t *fd = intfstream_open_file(real_path,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
       if (fd)
       {
-         int64_t fsize       = intfstream_get_size(fd);
-         int copier_offset   = (fsize % 1024 == 512) ? 512 : 0;
-         uint8_t lo_hdr[32]  = {0};
-         uint8_t hi_hdr[32]  = {0};
-         int lo_score        = 0;
-         int hi_score        = 0;
-         const uint8_t *winner;
-         int i;
-
-         if (fsize < copier_offset + 0x8000) /* too small for valid SNES ROM */
-         {
-            intfstream_close(fd);
-            free(fd);
-            return;
-         }
-
-         /* Read LoROM header candidate at file offset $7FC0 */
-         if (fsize >= copier_offset + 0x7FC0 + 32)
-         {
-            intfstream_seek(fd, copier_offset + 0x7FC0, SEEK_SET);
-            intfstream_read(fd, lo_hdr, 32);
-         }
-
-         /* Read HiROM header candidate at file offset $FFC0 */
-         if (fsize >= copier_offset + 0xFFC0 + 32)
-         {
-            intfstream_seek(fd, copier_offset + 0xFFC0, SEEK_SET);
-            intfstream_read(fd, hi_hdr, 32);
-         }
-
+         emulnk_try_snes_serial(fd, raw_serial, sizeof(raw_serial));
          intfstream_close(fd);
          free(fd);
-
-         /* Score LoROM: map mode byte at header+0x15.
-          * Valid map modes: 0x20 (LoROM), 0x30 (LoROM+FastROM).
-          * Bit 0 clear = LoROM. */
-         {
-            uint8_t map   = lo_hdr[0x15];
-            uint8_t rom_type = lo_hdr[0x16];
-            uint16_t comp = lo_hdr[0x1C] | (lo_hdr[0x1D] << 8);
-            uint16_t csum = lo_hdr[0x1E] | (lo_hdr[0x1F] << 8);
-
-            if ((map & 0x01) == 0 && (map == 0x20 || map == 0x30))
-               lo_score += 5;
-            if (rom_type <= 0x03)
-               lo_score += 1;
-            if ((comp ^ csum) == 0xFFFF && comp != 0)
-               lo_score += 8;
-            for (i = 0; i < 21; i++)
-               if (lo_hdr[i] >= 0x20 && lo_hdr[i] <= 0x7E)
-                  lo_score++;
-         }
-
-         /* Score HiROM: map mode byte at header+0x15.
-          * Valid map modes: 0x21 (HiROM), 0x31 (HiROM+FastROM),
-          * 0x35 (ExHiROM). Bit 0 set = HiROM. */
-         {
-            uint8_t map   = hi_hdr[0x15];
-            uint8_t rom_type = hi_hdr[0x16];
-            uint16_t comp = hi_hdr[0x1C] | (hi_hdr[0x1D] << 8);
-            uint16_t csum = hi_hdr[0x1E] | (hi_hdr[0x1F] << 8);
-
-            if ((map & 0x01) == 1 && (map == 0x21 || map == 0x31 || map == 0x35))
-               hi_score += 5;
-            if (rom_type <= 0x03)
-               hi_score += 1;
-            if ((comp ^ csum) == 0xFFFF && comp != 0)
-               hi_score += 8;
-            for (i = 0; i < 21; i++)
-               if (hi_hdr[i] >= 0x20 && hi_hdr[i] <= 0x7E)
-                  hi_score++;
-         }
-
-         /* Tie defaults to LoROM (more common mapping) */
-         winner = (hi_score > lo_score) ? hi_hdr : lo_hdr;
-         memcpy(raw_serial, winner, 21);
-         raw_serial[21] = '\0';
-
-         /* Trim trailing spaces */
-         for (i = 20; i >= 0; i--)
-         {
-            if (raw_serial[i] == ' '
-                  || raw_serial[i] == '\0')
-               raw_serial[i] = '\0';
-            else
-               break;
-         }
       }
    }
    else if (string_is_equal_noncase(ext, "md")
@@ -1621,7 +1747,8 @@ static void emulnk_extract_game_serial(void)
       }
    }
 
-   /* Prefix with platform tag for 0x00200000 disambiguation */
+add_tag:
+   /* Prefix with platform tag for serial disambiguation */
    if (raw_serial[0] != '\0')
    {
       tag = emulnk_get_platform_tag(ext, core_name);
@@ -1632,6 +1759,436 @@ static void emulnk_extract_game_serial(void)
          strlcpy(emulnk_game_serial, raw_serial,
                sizeof(emulnk_game_serial));
    }
+}
+
+/**
+ * emulnk_compute_game_hash:
+ *
+ * Computes the normalized MD5 hash of the currently loaded ROM and stores
+ * the 32-char hex result in emulnk_game_hash[]. Per-platform normalization:
+ *   GBA, GB, GBC : hash entire file
+ *   NES          : strip 16-byte iNES header (+ optional 512-byte trainer)
+ *   SNES         : strip 512-byte copier header if file_size % 1024 == 512
+ *   N64          : normalize byte order to Z64 (big-endian) before hashing
+ *   Genesis      : de-interleave SMD format before hashing
+ */
+static void emulnk_compute_game_hash(void)
+{
+   const char *content_path = path_get(RARCH_PATH_CONTENT);
+   const char *real_path    = NULL;
+   const char *ext          = NULL;
+   content_state_t *p_content = content_state_get_ptr();
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char *core_name    = runloop_st->system.info.library_name;
+   intfstream_t *fd         = NULL;
+   MD5_CTX ctx;
+   uint8_t digest[16];
+   uint8_t buf[8192];
+   int i;
+
+   emulnk_game_hash[0]  = '\0';
+   emulnk_hash_computed = true;
+
+   if (string_is_empty(content_path))
+   {
+      emulnk_hash_content[0] = '\0';
+      return;
+   }
+
+   strlcpy(emulnk_hash_content, content_path,
+         sizeof(emulnk_hash_content));
+
+   /* Resolve real path (handles archives) */
+   if (   p_content
+       && p_content->content_list
+       && p_content->content_list->entries
+       && !string_is_empty(p_content->content_list->entries[0].full_path))
+      real_path = p_content->content_list->entries[0].full_path;
+   else
+      real_path = content_path;
+
+   ext = path_get_extension(real_path);
+
+   if (string_is_empty(ext))
+      return;
+
+   /* Disc image formats (PS1): skip hashing for now.
+    * Full support requires extracting the main executable from the disc.
+    * Empty hash → app falls back to serial-based lookup. */
+   if (   string_is_equal_noncase(ext, "cue")
+       || string_is_equal_noncase(ext, "m3u")
+       || string_is_equal_noncase(ext, "chd")
+       || string_is_equal_noncase(ext, "iso"))
+      return;
+
+#ifdef HAVE_ZLIB
+   /* --- Archive path (e.g. game.zip#rom.gba): extract to memory --- */
+   if (path_contains_compressed_file(real_path))
+   {
+      void *arc_buf        = NULL;
+      int64_t arc_len      = 0;
+      uint8_t *data        = NULL;
+      int64_t data_len     = 0;
+      const char *arc_delim;
+
+      if (!file_archive_compressed_read(real_path,
+            &arc_buf, NULL, &arc_len) || !arc_buf || arc_len <= 0)
+      {
+         free(arc_buf);
+         return;
+      }
+
+      /* Resolve inner file extension from path after '#' delimiter */
+      arc_delim = path_get_archive_delim(real_path);
+      if (arc_delim)
+         ext = path_get_extension(arc_delim + 1);
+
+      if (string_is_empty(ext))
+      {
+         free(arc_buf);
+         return;
+      }
+
+      data     = (uint8_t *)arc_buf;
+      data_len = arc_len;
+
+      MD5_Init(&ctx);
+
+      /* --- GBA, GB, GBC: hash entire buffer --- */
+      if (   string_is_equal_noncase(ext, "gba")
+          || string_is_equal_noncase(ext, "gb")
+          || string_is_equal_noncase(ext, "gbc"))
+      {
+         MD5_Update(&ctx, data, (unsigned long)data_len);
+      }
+      /* --- NES: strip iNES header (16 bytes) + optional trainer (512 bytes) --- */
+      else if (string_is_equal_noncase(ext, "nes"))
+      {
+         int64_t data_offset = 0;
+
+         if (   data_len >= 16
+             && data[0] == 'N' && data[1] == 'E'
+             && data[2] == 'S' && data[3] == 0x1A)
+         {
+            data_offset = 16;
+            if (data[6] & 0x04)
+               data_offset += 512;
+         }
+
+         if (data_offset < data_len)
+            MD5_Update(&ctx, data + data_offset,
+                  (unsigned long)(data_len - data_offset));
+      }
+      /* --- SNES: strip 512-byte copier header if present --- */
+      else if (string_is_equal_noncase(ext, "sfc")
+            || string_is_equal_noncase(ext, "smc")
+            || string_is_equal_noncase(ext, "swc")
+            || string_is_equal_noncase(ext, "fig"))
+      {
+         int64_t offset = (data_len % 1024 == 512) ? 512 : 0;
+         MD5_Update(&ctx, data + offset,
+               (unsigned long)(data_len - offset));
+      }
+      /* --- N64: normalize byte order to Z64 then hash --- */
+      else if (string_is_equal_noncase(ext, "n64")
+            || string_is_equal_noncase(ext, "z64")
+            || string_is_equal_noncase(ext, "v64"))
+      {
+         if (data_len >= 4)
+         {
+            if (data[0] == 0x37 && data[1] == 0x80)
+            {
+               /* v64: swap each pair of bytes */
+               for (i = 0; i + 1 < (int)data_len; i += 2)
+               {
+                  uint8_t tmp = data[i];
+                  data[i]     = data[i + 1];
+                  data[i + 1] = tmp;
+               }
+            }
+            else if (data[0] == 0x40 && data[1] == 0x12)
+            {
+               /* n64: reverse each 4-byte word */
+               for (i = 0; i + 3 < (int)data_len; i += 4)
+               {
+                  uint8_t tmp0 = data[i];
+                  uint8_t tmp1 = data[i + 1];
+                  data[i]      = data[i + 3];
+                  data[i + 1]  = data[i + 2];
+                  data[i + 2]  = tmp1;
+                  data[i + 3]  = tmp0;
+               }
+            }
+         }
+         MD5_Update(&ctx, data, (unsigned long)data_len);
+      }
+      /* --- Genesis/MD: de-interleave SMD format --- */
+      else if (string_is_equal_noncase(ext, "md")
+            || string_is_equal_noncase(ext, "gen")
+            || string_is_equal_noncase(ext, "smd")
+            || string_is_equal_noncase(ext, "bin")
+            || string_is_equal_noncase(ext, "img"))
+      {
+         bool is_smd     = false;
+         bool is_genesis  = false;
+
+         if (   string_is_equal_noncase(ext, "bin")
+             || string_is_equal_noncase(ext, "img"))
+         {
+            if (   core_name
+                && (   string_is_equal(core_name, "Genesis Plus GX")
+                    || string_is_equal(core_name, "Genesis Plus GX Wide")))
+               is_genesis = true;
+         }
+         else
+            is_genesis = true;
+
+         if (is_genesis && data_len > 512
+               && ((data_len - 512) % 16384) == 0)
+            is_smd = true;
+
+         if (is_genesis && is_smd)
+         {
+            int64_t pos = 512;
+            uint8_t deint[16384];
+
+            while (pos + 16384 <= data_len)
+            {
+               uint8_t *block = data + pos;
+
+               for (i = 0; i < 8192; i++)
+               {
+                  deint[i * 2]     = block[i];
+                  deint[i * 2 + 1] = block[8192 + i];
+               }
+
+               MD5_Update(&ctx, deint, 16384);
+               pos += 16384;
+            }
+         }
+         else
+            MD5_Update(&ctx, data, (unsigned long)data_len);
+      }
+      /* --- FDS, UNIF, or unknown: hash entire buffer --- */
+      else
+         MD5_Update(&ctx, data, (unsigned long)data_len);
+
+      free(arc_buf);
+
+      MD5_Final(digest, &ctx);
+
+      for (i = 0; i < 16; i++)
+         snprintf(emulnk_game_hash + i * 2, 3, "%02x", digest[i]);
+      emulnk_game_hash[32] = '\0';
+      return;
+   }
+#endif
+
+   fd = intfstream_open_file(real_path,
+         RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   if (!fd)
+      return;
+
+   MD5_Init(&ctx);
+
+   /* --- GBA, GB, GBC: hash entire file --- */
+   if (   string_is_equal_noncase(ext, "gba")
+       || string_is_equal_noncase(ext, "gb")
+       || string_is_equal_noncase(ext, "gbc"))
+   {
+      for (;;)
+      {
+         int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+         if (nread <= 0)
+            break;
+         MD5_Update(&ctx, buf, (unsigned long)nread);
+      }
+   }
+   /* --- NES: strip iNES header (16 bytes) + optional trainer (512 bytes) --- */
+   else if (string_is_equal_noncase(ext, "nes"))
+   {
+      uint8_t hdr[16];
+      int64_t data_offset;
+      int64_t fsize = intfstream_get_size(fd);
+
+      intfstream_seek(fd, 0, SEEK_SET);
+      if (fsize >= 16 && intfstream_read(fd, hdr, 16) == 16
+          && hdr[0] == 'N' && hdr[1] == 'E'
+          && hdr[2] == 'S' && hdr[3] == 0x1A)
+      {
+         data_offset = 16;
+         if (hdr[6] & 0x04)
+            data_offset += 512;
+         intfstream_seek(fd, data_offset, SEEK_SET);
+      }
+      else
+         intfstream_seek(fd, 0, SEEK_SET); /* not iNES, hash whole file */
+
+      for (;;)
+      {
+         int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+         if (nread <= 0)
+            break;
+         MD5_Update(&ctx, buf, (unsigned long)nread);
+      }
+   }
+   /* --- SNES: strip 512-byte copier header if present --- */
+   else if (string_is_equal_noncase(ext, "sfc")
+         || string_is_equal_noncase(ext, "smc")
+         || string_is_equal_noncase(ext, "swc")
+         || string_is_equal_noncase(ext, "fig"))
+   {
+      int64_t fsize = intfstream_get_size(fd);
+      int64_t offset = (fsize % 1024 == 512) ? 512 : 0;
+
+      intfstream_seek(fd, offset, SEEK_SET);
+      for (;;)
+      {
+         int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+         if (nread <= 0)
+            break;
+         MD5_Update(&ctx, buf, (unsigned long)nread);
+      }
+   }
+   /* --- N64: normalize byte order to Z64 then hash --- */
+   else if (string_is_equal_noncase(ext, "n64")
+         || string_is_equal_noncase(ext, "z64")
+         || string_is_equal_noncase(ext, "v64"))
+   {
+      uint8_t magic[4];
+      int swap_mode = 0; /* 0=z64 (none), 1=v64 (byte-swap), 2=n64 (word-swap) */
+
+      intfstream_seek(fd, 0, SEEK_SET);
+      if (intfstream_read(fd, magic, 4) != 4)
+         goto done;
+
+      if (magic[0] == 0x37 && magic[1] == 0x80)
+         swap_mode = 1; /* v64 */
+      else if (magic[0] == 0x40 && magic[1] == 0x12)
+         swap_mode = 2; /* n64 */
+      /* else z64 or unknown — hash as-is */
+
+      intfstream_seek(fd, 0, SEEK_SET);
+      for (;;)
+      {
+         int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+         if (nread <= 0)
+            break;
+
+         if (swap_mode == 1)
+         {
+            /* v64: swap each pair of bytes */
+            for (i = 0; i + 1 < (int)nread; i += 2)
+            {
+               uint8_t tmp = buf[i];
+               buf[i]      = buf[i + 1];
+               buf[i + 1]  = tmp;
+            }
+         }
+         else if (swap_mode == 2)
+         {
+            /* n64: reverse each 4-byte word */
+            for (i = 0; i + 3 < (int)nread; i += 4)
+            {
+               uint8_t tmp0 = buf[i];
+               uint8_t tmp1 = buf[i + 1];
+               buf[i]       = buf[i + 3];
+               buf[i + 1]   = buf[i + 2];
+               buf[i + 2]   = tmp1;
+               buf[i + 3]   = tmp0;
+            }
+         }
+
+         MD5_Update(&ctx, buf, (unsigned long)nread);
+      }
+   }
+   /* --- Genesis/MD: de-interleave SMD format --- */
+   else if (string_is_equal_noncase(ext, "md")
+         || string_is_equal_noncase(ext, "gen")
+         || string_is_equal_noncase(ext, "smd")
+         || string_is_equal_noncase(ext, "bin")
+         || string_is_equal_noncase(ext, "img"))
+   {
+      int64_t fsize  = intfstream_get_size(fd);
+      bool is_smd    = false;
+      bool is_genesis = false;
+
+      /* For .bin/.img, check if this is actually Genesis via core name */
+      if (   string_is_equal_noncase(ext, "bin")
+          || string_is_equal_noncase(ext, "img"))
+      {
+         if (   core_name
+             && (   string_is_equal(core_name, "Genesis Plus GX")
+                 || string_is_equal(core_name, "Genesis Plus GX Wide")))
+            is_genesis = true;
+      }
+      else
+         is_genesis = true;
+
+      if (is_genesis && fsize > 512 && ((fsize - 512) % 16384) == 0)
+         is_smd = true;
+
+      if (is_genesis && is_smd)
+      {
+         /* SMD: skip 512-byte header, read 16KB blocks, de-interleave */
+         uint8_t block[16384];
+         uint8_t deint[16384];
+         int64_t pos = 512;
+
+         while (pos < fsize)
+         {
+            int64_t nread;
+            intfstream_seek(fd, pos, SEEK_SET);
+            nread = intfstream_read(fd, block, 16384);
+            if (nread != 16384)
+               break;
+
+            /* De-interleave: first 8KB = even byte positions,
+             * second 8KB = odd byte positions */
+            for (i = 0; i < 8192; i++)
+            {
+               deint[i * 2]     = block[i];         /* even: first 8KB */
+               deint[i * 2 + 1] = block[8192 + i];  /* odd: second 8KB */
+            }
+
+            MD5_Update(&ctx, deint, 16384);
+            pos += 16384;
+         }
+      }
+      else
+      {
+         /* Raw binary / non-SMD genesis / PS1 .bin: hash entire file */
+         intfstream_seek(fd, 0, SEEK_SET);
+         for (;;)
+         {
+            int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+            if (nread <= 0)
+               break;
+            MD5_Update(&ctx, buf, (unsigned long)nread);
+         }
+      }
+   }
+   /* --- FDS, UNIF, or unknown: hash entire file --- */
+   else
+   {
+      for (;;)
+      {
+         int64_t nread = intfstream_read(fd, buf, sizeof(buf));
+         if (nread <= 0)
+            break;
+         MD5_Update(&ctx, buf, (unsigned long)nread);
+      }
+   }
+
+done:
+   intfstream_close(fd);
+   free(fd);
+
+   MD5_Final(digest, &ctx);
+
+   for (i = 0; i < 16; i++)
+      snprintf(emulnk_game_hash + i * 2, 3, "%02x", digest[i]);
+   emulnk_game_hash[32] = '\0';
 }
 #endif
 
@@ -1760,36 +2317,6 @@ static void command_handle_emulnk_binary(command_t *handle,
            | ((uint32_t)buf[5] << 8)
            | ((uint32_t)buf[6] << 16)
            | ((uint32_t)buf[7] << 24);
-
-   /* Reset serial cache if content path changed */
-   if (emulnk_serial_extracted)
-   {
-      const char *cur_path = path_get(RARCH_PATH_CONTENT);
-      if (   string_is_empty(cur_path)
-          || !string_is_equal(cur_path, emulnk_serial_content))
-         emulnk_serial_extracted = false;
-   }
-
-   /* Virtual address: game serial extracted from disc image */
-   if (address == EMULNK_VIRTUAL_GAME_SERIAL_ADDR && len == 8)
-   {
-      if (!emulnk_serial_extracted || emulnk_game_serial[0] == '\0')
-         emulnk_extract_game_serial();
-      if (emulnk_game_serial[0] != '\0')
-      {
-         uint32_t serial_len = (uint32_t)strlen(emulnk_game_serial);
-         if (size > serial_len)
-            size = serial_len;
-      }
-      else
-         size = 0;
-      /* Always respond — empty response means no serial detected,
-       * avoids client timeout on unsupported formats */
-      sendto(netcmd->net_fd, emulnk_game_serial, size, 0,
-            (struct sockaddr*)&netcmd->cmd_source,
-            netcmd->cmd_source_len);
-      return;
-   }
 
    if (len == 8)
    {
