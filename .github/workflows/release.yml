@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/i686-linux-android \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: 11
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Install NDK 22.0.7026061
+        run: yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;22.0.7026061" || true
+
+      - name: Decode keystore
+        run: echo "${{ secrets.SIGNING_KEY }}" | tr -d '\n\r ' | base64 -d > /tmp/release.jks
+
+      - name: Build & sign release APK
+        working-directory: pkg/android/phoenix
+        run: |
+          ./gradlew assembleAarch64Release \
+            -PRELEASE_STORE_FILE=/tmp/release.jks \
+            -PRELEASE_STORE_PASSWORD="${{ secrets.KEY_STORE_PASSWORD }}" \
+            -PRELEASE_KEY_ALIAS="${{ secrets.ALIAS }}" \
+            -PRELEASE_KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
+
+      - name: Rename APK
+        run: |
+          APK=$(find pkg/android/phoenix/build -name '*.apk' -path '*/aarch64/release/*' | head -1)
+          mv "$APK" retroarch-lnk-${{ github.ref_name }}.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RetroArch Lnk ${{ github.ref_name }}
+          body: ""
+          files: retroarch-lnk-${{ github.ref_name }}.apk
+          draft: true
+          prerelease: false
