@@ -284,7 +284,7 @@ static int intfstream_get_serial(intfstream_t *fd, char *s, size_t len, const ch
    return 0;
 }
 
-static bool intfstream_file_get_serial(const char *name,
+bool intfstream_file_get_serial(const char *name,
       uint64_t offset, int64_t size, char *s, size_t len, uint64_t *fsize)
 {
    int rv;
@@ -344,7 +344,7 @@ error:
    return 0;
 }
 
-static int task_database_cue_get_serial(const char *name, char *s, size_t len, uint64_t *filesize)
+int task_database_cue_get_serial(const char *name, char *s, size_t len, uint64_t *filesize)
 {
    char track_path[PATH_MAX_LENGTH];
    uint64_t offset  = 0;
@@ -413,7 +413,7 @@ static bool is_chd_file_cdi(const char *path)
    return is_cdi;
 }
 
-static int task_database_chd_get_serial(const char *name, char *serial, size_t len, uint64_t *filesize)
+int task_database_chd_get_serial(const char *name, char *serial, size_t len, uint64_t *filesize)
 {
    int result;
    int32_t track;

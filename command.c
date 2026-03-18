@@ -75,7 +75,12 @@
 #include "version.h"
 #include "version_git.h"
 #include "tasks/task_content.h"
-#include "tasks/task_database_cue.h"
+
+/* from tasks/task_database.c (de-static'd for griffin) */
+bool intfstream_file_get_serial(const char *name,
+      uint64_t offset, int64_t size, char *s, size_t len, uint64_t *fsize);
+int task_database_cue_get_serial(const char *name, char *s, size_t len, uint64_t *filesize);
+int task_database_chd_get_serial(const char *name, char *serial, size_t len, uint64_t *filesize);
 
 #define CMD_BUF_SIZE 4096
 
