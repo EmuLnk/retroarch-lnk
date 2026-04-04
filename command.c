@@ -82,6 +82,11 @@ bool intfstream_file_get_serial(const char *name,
 int task_database_cue_get_serial(const char *name, char *s, size_t len, uint64_t *filesize);
 int task_database_chd_get_serial(const char *name, char *serial, size_t len, uint64_t *filesize);
 
+static uint8_t *command_memory_get_pointer(
+      const rarch_system_info_t* sys_info,
+      unsigned address, unsigned int* max_bytes,
+      int for_write, char *s, size_t len);
+
 #define CMD_BUF_SIZE 4096
 
 static void command_post_state_loaded(void)
@@ -241,7 +246,7 @@ static char emulnk_hash_content[PATH_MAX_LENGTH] = {0};
 static void command_network_poll(command_t *handle)
 {
    ssize_t ret;
-   char buf[2048];
+   char buf[2080];
    command_network_t *netcmd = (command_network_t*)handle->userptr;
 
    if (netcmd->net_fd < 0)
@@ -309,6 +314,66 @@ static void command_network_poll(command_t *handle)
                 (struct sockaddr*)&netcmd->cmd_source,
                 netcmd->cmd_source_len);
          continue;
+      }
+
+      /* EmuLnk batch read: "EL" magic (0x45, 0x4C) + count + entries */
+      if (ret >= 4 && buf[0] == 0x45 && buf[1] == 0x4C)
+      {
+         uint16_t count = (uint8_t)buf[2] | ((uint8_t)buf[3] << 8);
+         if (count > 0 && count <= 256
+               && ret >= (ssize_t)(4 + count * 8))
+         {
+            uint8_t response[16384];
+            int resp_off = 4;
+            runloop_state_t *runloop_st = runloop_state_get_ptr();
+            rarch_system_info_t *sys_info = &runloop_st->system;
+
+            response[0] = 0x45;
+            response[1] = 0x4C;
+            response[2] = count & 0xFF;
+            response[3] = (count >> 8) & 0xFF;
+
+            for (uint16_t i = 0; i < count; i++)
+            {
+               int req_off = 4 + i * 8;
+               uint32_t addr = (uint8_t)buf[req_off]
+                             | ((uint8_t)buf[req_off+1] << 8)
+                             | ((uint8_t)buf[req_off+2] << 16)
+                             | ((uint8_t)buf[req_off+3] << 24);
+               uint32_t size = (uint8_t)buf[req_off+4]
+                             | ((uint8_t)buf[req_off+5] << 8)
+                             | ((uint8_t)buf[req_off+6] << 16)
+                             | ((uint8_t)buf[req_off+7] << 24);
+               unsigned int max_bytes = 0;
+               char err[64] = "";
+               uint8_t *data;
+
+               if (size > 4096)
+                  size = 4096;
+
+               data = command_memory_get_pointer(
+                     sys_info, addr, &max_bytes, 0, err, sizeof(err));
+
+               if (data && max_bytes >= size
+                     && resp_off + 2 + (int)size <= (int)sizeof(response))
+               {
+                  response[resp_off++] = size & 0xFF;
+                  response[resp_off++] = (size >> 8) & 0xFF;
+                  memcpy(response + resp_off, data, size);
+                  resp_off += size;
+               }
+               else
+               {
+                  response[resp_off++] = 0;
+                  response[resp_off++] = 0;
+               }
+            }
+
+            sendto(netcmd->net_fd, (const char*)response, resp_off, 0,
+                   (struct sockaddr*)&netcmd->cmd_source,
+                   netcmd->cmd_source_len);
+            continue;
+         }
       }
 
       /* EmuLnk binary protocol detection: the first 4 bytes encode a
@@ -2318,8 +2383,8 @@ static void command_handle_emulnk_binary(command_t *handle,
       /* READ request: 8-byte header only */
       const uint8_t *data;
 
-      if (size > 2048)
-         size = 2048;
+      if (size > 4096)
+         size = 4096;
 
       data = command_memory_get_pointer(sys_info, address, &max_bytes,
             0, error_buf, sizeof(error_buf));
