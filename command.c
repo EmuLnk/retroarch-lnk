@@ -317,21 +317,21 @@ static void command_network_poll(command_t *handle)
       }
 
       /* EmuLnk batch read: "EL" magic (0x45, 0x4C) + count + entries */
+      #define EMULNK_MAX_READ 4096
       if (ret >= 4 && buf[0] == 0x45 && buf[1] == 0x4C)
       {
          uint16_t count = (uint8_t)buf[2] | ((uint8_t)buf[3] << 8);
          if (count > 0 && count <= 256
                && ret >= (ssize_t)(4 + count * 8))
          {
-            uint8_t response[16384];
+            uint8_t response[65000];
             int resp_off = 4;
+            uint16_t actual = 0;
             runloop_state_t *runloop_st = runloop_state_get_ptr();
             rarch_system_info_t *sys_info = &runloop_st->system;
 
             response[0] = 0x45;
             response[1] = 0x4C;
-            response[2] = count & 0xFF;
-            response[3] = (count >> 8) & 0xFF;
 
             for (uint16_t i = 0; i < count; i++)
             {
@@ -348,8 +348,8 @@ static void command_network_poll(command_t *handle)
                char err[64] = "";
                uint8_t *data;
 
-               if (size > 4096)
-                  size = 4096;
+               if (size > EMULNK_MAX_READ)
+                  size = EMULNK_MAX_READ;
 
                data = command_memory_get_pointer(
                      sys_info, addr, &max_bytes, 0, err, sizeof(err));
@@ -361,13 +361,20 @@ static void command_network_poll(command_t *handle)
                   response[resp_off++] = (size >> 8) & 0xFF;
                   memcpy(response + resp_off, data, size);
                   resp_off += size;
+                  actual++;
                }
-               else
+               else if (resp_off + 2 <= (int)sizeof(response))
                {
                   response[resp_off++] = 0;
                   response[resp_off++] = 0;
+                  actual++;
                }
+               else
+                  break;
             }
+
+            response[2] = actual & 0xFF;
+            response[3] = (actual >> 8) & 0xFF;
 
             sendto(netcmd->net_fd, (const char*)response, resp_off, 0,
                    (struct sockaddr*)&netcmd->cmd_source,
@@ -2383,8 +2390,8 @@ static void command_handle_emulnk_binary(command_t *handle,
       /* READ request: 8-byte header only */
       const uint8_t *data;
 
-      if (size > 4096)
-         size = 4096;
+      if (size > EMULNK_MAX_READ)
+         size = EMULNK_MAX_READ;
 
       data = command_memory_get_pointer(sys_info, address, &max_bytes,
             0, error_buf, sizeof(error_buf));
