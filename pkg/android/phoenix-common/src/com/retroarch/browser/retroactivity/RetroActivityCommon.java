@@ -33,6 +33,10 @@ import android.util.Log;
 
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -162,6 +166,58 @@ public class RetroActivityCommon extends NativeActivity
   public void onRetroArchExit()
   {
       finish();
+  }
+
+  // Called from native code when user selects "Load Configuration".
+  // Copies the selected config to the default path, sanitizes it,
+  // and restarts the process so it boots with the new configuration.
+  public void restartWithConfig(String configPath)
+  {
+      Log.i("RetroActivity", "restartWithConfig: " + configPath);
+
+      String defaultPath = UserPreferences.getDefaultConfigPath(this);
+
+      if (!configPath.equals(defaultPath))
+      {
+          File tmpFile = new File(defaultPath + ".tmp");
+          try (InputStream in = new FileInputStream(new File(configPath));
+               OutputStream out = new FileOutputStream(tmpFile))
+          {
+              byte[] buf = new byte[8192];
+              int len;
+              while ((len = in.read(buf)) > 0)
+                  out.write(buf, 0, len);
+          }
+          catch (Exception e)
+          {
+              Log.e("RetroActivity", "Failed to copy config: " + e.getMessage());
+              tmpFile.delete();
+              return;
+          }
+
+          if (!tmpFile.renameTo(new File(defaultPath)))
+          {
+              Log.e("RetroActivity", "Failed to rename temp config to: " + defaultPath);
+              tmpFile.delete();
+              return;
+          }
+      }
+
+      UserPreferences.updateConfigFile(this);
+
+      // Restart the process to apply the new config.
+      // Uses startActivity (not am start) to avoid the 6s cold-start delay.
+      Intent launchIntent = getPackageManager()
+            .getLaunchIntentForPackage(getPackageName());
+      if (launchIntent != null)
+      {
+          launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+          startActivity(launchIntent);
+      }
+
+      finish();
+      System.exit(0);
   }
 
   public int getVolumeCount()

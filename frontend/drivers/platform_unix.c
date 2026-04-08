@@ -2155,6 +2155,8 @@ static void frontend_unix_init(void *data)
          "getIntent", "()Landroid/content/Intent;");
    GET_METHOD_ID(env, android_app->onRetroArchExit, class,
          "onRetroArchExit", "()V");
+   GET_METHOD_ID(env, android_app->restartWithConfig, class,
+         "restartWithConfig", "(Ljava/lang/String;)V");
    GET_METHOD_ID(env, android_app->isAndroidTV, class,
          "isAndroidTV", "()Z");
    GET_METHOD_ID(env, android_app->getPowerstate, class,

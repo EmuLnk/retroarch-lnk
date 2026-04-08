@@ -29,7 +29,7 @@ public final class ConfigFile
 
 	/**
 	 * Constructor
-	 * 
+	 *
 	 * @param filePath The path to the configuration file to open.
 	 */
 	public ConfigFile(String filePath)
@@ -37,7 +37,7 @@ public final class ConfigFile
 		if (filePath == null)
 			throw new IllegalArgumentException("filePath cannot be null.");
 
-		try 
+		try
 		{
 			open(filePath);
 		}
@@ -50,7 +50,7 @@ public final class ConfigFile
 	/**
 	 * Parses a configuration file from the given stream
 	 * and appends the parsed values to the key-value map.
-	 * 
+	 *
 	 * @param stream The {@link InputStream} containing the configuration file to parse.
 	 */
 	public void append(InputStream stream) throws IOException
@@ -68,7 +68,7 @@ public final class ConfigFile
 	 * Opens a configuration file given by configPath
 	 * and parses all of its key-value pairs, adding
 	 * them to the key-value map.
-	 * 
+	 *
 	 * @param configPath Path to the configuration file to parse.
 	 */
 	public void open(String configPath) throws IOException
@@ -107,10 +107,20 @@ public final class ConfigFile
 	}
 
 	/**
-	 * Writes the currently set key-value pairs to 
-	 * 
-	 * @param path         The path to save the 
-	 * 
+	 * Gets the underlying map of key-value pairs.
+	 *
+	 * @return the HashMap containing all key value pairs.
+	 */
+	public HashMap<String, String> getMap()
+	{
+		return map;
+	}
+
+	/**
+	 * Writes the currently set key-value pairs to
+	 *
+	 * @param path         The path to save the
+	 *
 	 * @throws IOException
 	 */
 	public void write(String path) throws IOException
@@ -128,9 +138,9 @@ public final class ConfigFile
 	/**
 	 * Checks if a key exists in the {@link HashMap}
 	 * backing this ConfigFile instance.
-	 * 
+	 *
 	 * @param key The key to check for.
-	 * 
+	 *
 	 * @return true if the key exists in the HashMap backing
 	 *         this ConfigFile; false if it doesn't.
 	 */
@@ -141,7 +151,7 @@ public final class ConfigFile
 
 	/**
 	 * Sets a key to the given String value.
-	 * 
+	 *
 	 * @param key   The key to set the String value to.
 	 * @param value The String value to set to the key.
 	 */
@@ -152,7 +162,7 @@ public final class ConfigFile
 
 	/**
 	 * Sets a key to the given boolean value.
-	 * 
+	 *
 	 * @param key   The key to set the boolean value to.
 	 * @param value The boolean value to set to the key.
 	 */
@@ -163,7 +173,7 @@ public final class ConfigFile
 
 	/**
 	 * Sets a key to the given Integer value.
-	 * 
+	 *
 	 * @param key   The key to set the Integer value to.
 	 * @param value The Integer value to set to the key.
 	 */
@@ -174,7 +184,7 @@ public final class ConfigFile
 
 	/**
 	 * Sets a key to the given double value.
-	 * 
+	 *
 	 * @param key   The key to set the double value to.
 	 * @param value The double value to set to the key.
 	 */
@@ -182,10 +192,10 @@ public final class ConfigFile
 	{
 		map.put(key, Double.toString(value));
 	}
-	
+
 	/**
 	 * Sets a key to the given float value.
-	 * 
+	 *
 	 * @param key   The key to set the float value to.
 	 * @param value The float value to set to the key.
 	 */
@@ -196,9 +206,9 @@ public final class ConfigFile
 
 	/**
 	 * Gets the String value associated with the given key.
-	 * 
+	 *
 	 * @param key The key to get the String value from.
-	 * 
+	 *
 	 * @return the String object associated with the given key.
 	 */
 	public String getString(String key)
@@ -213,9 +223,9 @@ public final class ConfigFile
 
 	/**
 	 * Gets the Integer value associated with the given key.
-	 * 
+	 *
 	 * @param key The key to get the Integer value from.
-	 * 
+	 *
 	 * @return the Integer value associated with the given key.
 	 */
 	public int getInt(String key)
@@ -230,9 +240,9 @@ public final class ConfigFile
 
 	/**
 	 * Gets the double value associated with the given key.
-	 * 
+	 *
 	 * @param key The key to get the double value from.
-	 * 
+	 *
 	 * @return the double value associated with the given key.
 	 */
 	public double getDouble(String key)
@@ -247,9 +257,9 @@ public final class ConfigFile
 
 	/**
 	 * Gets the float value associated with the given key.
-	 * 
+	 *
 	 * @param key The key to get the float value from.
-	 * 
+	 *
 	 * @return the float value associated with the given key.
 	 */
 	public float getFloat(String key)
@@ -264,9 +274,9 @@ public final class ConfigFile
 
 	/**
 	 * Gets the boolean value associated with the given key.
-	 * 
+	 *
 	 * @param key The key to get the boolean value from.
-	 * 
+	 *
 	 * @return the boolean value associated with the given key.
 	 */
 	public boolean getBoolean(String key)

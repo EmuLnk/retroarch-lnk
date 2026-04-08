@@ -151,6 +151,7 @@ struct android_app
    int8_t hat_state[DEFAULT_MAX_PADS][2];
    jmethodID getIntent;
    jmethodID onRetroArchExit;
+   jmethodID restartWithConfig;
    jmethodID getStringExtra;
    jmethodID clearPendingIntent;
    jmethodID hasPendingIntent;

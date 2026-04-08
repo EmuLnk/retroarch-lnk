@@ -2291,12 +2291,36 @@ static int generic_action_ok(const char *path,
 
             disp_get_ptr()->flags          |= GFX_DISP_FLAG_MSG_FORCE;
 
+#ifdef ANDROID
+            /* config_replace() reinits drivers without uniniting, leaving
+             * stale heap pointers. */
+            {
+               const char *rarch_path_config = path_get(RARCH_PATH_CONFIG);
+
+               if (!string_is_equal(action_path, rarch_path_config))
+               {
+                  if (config_save_on_exit
+                        && !path_is_empty(RARCH_PATH_CONFIG))
+                     config_save_file(rarch_path_config);
+
+                  {
+                     JNIEnv *env = jni_thread_getenv();
+                     if (env && g_android && g_android->restartWithConfig)
+                        CALL_VOID_METHOD_PARAM(env,
+                              g_android->activity->clazz,
+                              g_android->restartWithConfig,
+                              (*env)->NewStringUTF(env, action_path));
+                  }
+               }
+            }
+#else
             if (config_replace(config_save_on_exit, action_path))
             {
                bool pending_push            = false;
                menu_driver_ctl(MENU_NAVIGATION_CTL_CLEAR, &pending_push);
                ret = -1;
             }
+#endif
          }
 #endif
          break;

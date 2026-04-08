@@ -4307,6 +4307,12 @@ static bool config_load_file(global_t *global,
            settings->paths.directory_assets, libretro_assets_directory);
    } else if (string_is_equal(settings->paths.directory_assets, "default"))
       *settings->paths.directory_assets = '\0';
+   /* Restore default assets directory if empty (e.g. imported config) */
+   if (string_is_empty(settings->paths.directory_assets)
+         && !string_is_empty(g_defaults.dirs[DEFAULT_DIR_ASSETS]))
+      configuration_set_string(settings,
+            settings->paths.directory_assets,
+            g_defaults.dirs[DEFAULT_DIR_ASSETS]);
 #ifdef _3DS
    if (string_is_equal(settings->paths.directory_bottom_assets, "default"))
       configuration_set_string(settings,

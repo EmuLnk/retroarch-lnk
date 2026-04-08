@@ -2,6 +2,7 @@ package com.retroarch.browser.preferences.util;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Map;
 
 import android.annotation.TargetApi;
 import android.content.Context;
@@ -122,8 +123,70 @@ public final class UserPreferences
 		ConfigFile config = new ConfigFile(path);
 
 		final String dataDir = ctx.getApplicationInfo().dataDir;
+
+		// Sanitize paths from foreign RetroArch packages
+		final String currentPkgName = ctx.getPackageName();
+		boolean pathsSanitized = false;
+
+		if (!currentPkgName.equals("com.retroarch"))
+		{
+			final String currentSourceDir = ctx.getApplicationInfo().sourceDir;
+			String parentDir = dataDir.substring(0, dataDir.lastIndexOf('/') + 1);
+			String foreignDataDir = parentDir + "com.retroarch/";
+			String foreignDataDirAlt = "/data/data/com.retroarch/";
+			String dataDirSlash = dataDir + "/";
+
+			for (Map.Entry<String, String> entry : config.getMap().entrySet())
+			{
+				String val = entry.getValue();
+				if (val == null || val.isEmpty() || val.contains(currentPkgName))
+					continue;
+
+				String newVal = val;
+
+				if (newVal.contains(foreignDataDir))
+					newVal = newVal.replace(foreignDataDir, dataDirSlash);
+				else if (newVal.contains(foreignDataDirAlt))
+					newVal = newVal.replace(foreignDataDirAlt, dataDirSlash);
+
+				if (newVal.contains("/com.retroarch-") && newVal.contains("/data/app/"))
+					newVal = currentSourceDir;
+
+				if (!newVal.equals(val))
+				{
+					entry.setValue(newVal);
+					pathsSanitized = true;
+				}
+			}
+
+			// Populate missing directory keys (ConfigFile drops empty values,
+			// so absent keys were empty in the imported config).
+			// Without these, XMB crashes building paths from empty strings.
+			String[][] defaultDirs = {
+				{"assets_directory",      "/assets"},
+				{"joypad_autoconfig_dir", "/autoconfig"},
+				{"overlay_directory",     "/overlays"},
+				{"osk_overlay_directory", "/overlays"},
+				{"libretro_info_path",    "/info"},
+				{"content_database_path", "/database/rdb"},
+				{"cursor_database_path",  "/database/cursors"},
+				{"audio_filter_dir",      "/filters/audio"},
+				{"video_filter_dir",      "/filters/video"},
+				{"video_shader_dir",      "/shaders"},
+			};
+
+			for (String[] pair : defaultDirs)
+			{
+				if (!config.keyExists(pair[0]))
+				{
+					config.setString(pair[0], dataDir + pair[1]);
+					pathsSanitized = true;
+				}
+			}
+		}
+
 		final String coreDir = dataDir + "/cores/";
-		final String dstPath	= dataDir;
+		final String dstPath	= dataDir + "/assets";
 		final String dstPathSubdir = "assets";
 
 		final SharedPreferences prefs = getPreferences(ctx);
@@ -142,7 +205,14 @@ public final class UserPreferences
 					config.getInt("bundle_assets_extract_last_version") : 0;
 
 			if (version == last_version)
+			{
+				if (pathsSanitized)
+				{
+					try { config.write(path); }
+					catch (IOException e) { Log.e(TAG, "Failed to save config file to: " + path); }
+				}
 				return;
+			}
 
 			config.setString("bundle_assets_src_path", ctx.getApplicationInfo().sourceDir);
 			config.setString("bundle_assets_dst_path", dstPath);
