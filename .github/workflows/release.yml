@@ -43,6 +43,21 @@ jobs:
       - name: Decode keystore
         run: echo "${{ secrets.SIGNING_KEY }}" | tr -d '\n\r ' | base64 -d > /tmp/release.jks
 
+      - name: Download RetroArch assets
+        run: |
+          mkdir -p pkg/android/phoenix/assets/overlays
+          curl -sfL https://github.com/libretro/retroarch-assets/archive/refs/heads/master.tar.gz \
+            | tar xz --strip-components=1 -C pkg/android/phoenix/assets \
+              retroarch-assets-master/xmb \
+              retroarch-assets-master/glui \
+              retroarch-assets-master/ozone \
+              retroarch-assets-master/sounds \
+              retroarch-assets-master/fonts
+          curl -sfL https://github.com/libretro/common-overlays/archive/refs/heads/master.tar.gz \
+            | tar xz --strip-components=1 -C pkg/android/phoenix/assets/overlays
+          test -f pkg/android/phoenix/assets/xmb/monochrome/png/retroarch.png \
+            || { echo "Asset download failed"; exit 1; }
+
       - name: Build & sign release APK
         working-directory: pkg/android/phoenix
         run: |
